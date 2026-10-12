@@ -328,6 +328,12 @@ class QwenMLATritonImpl(TritonMLAImpl):
         kv_c_normed = kv_c_normed[:n]
         k_pe = k_pe.reshape(k_pe.shape[0], -1)[:n]
         pr, nh = self.mla_packed_rope, self.mla_local_heads
+        import os
+        if os.environ.get("QWEN_MLA_FP8_WRITE", "triton") == "triton":
+            # one launch, the same bytes as the torch ops below (ops/mla_fp8_write.py; any GPU)
+            from .ops.mla_fp8_write import mla_fp8_cache_write
+            return mla_fp8_cache_write(kv_c_normed, k_pe, kv_cache, slots, k_scale, pr, nh,
+                                       log8=mla_fp8_rms_mode() == "log8", log2_lo=RMS_LOG2_LO, log2_hi=RMS_LOG2_HI)
         inv = (1.0 / k_scale.float()).reshape(())
         f8 = torch.float8_e4m3fn
         lat = (kv_c_normed.float() * inv).clamp_(-448.0, 448.0).to(f8).view(torch.uint8)

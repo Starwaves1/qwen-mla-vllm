@@ -1,7 +1,7 @@
-"""CPU only: compile (not run) every Triton kernel the decode launches for an sm_86 target with an FP8 cache, from
+"""CPU only: compile (not run) every Triton kernel the decode and the FP8 cache write launch for an sm_86 target with an FP8 cache, from
 the real launch code (JITFunction.run forced to warmup=True, the driver reporting sm_86). With the uint8 carriage
 all of them compile; NATIVE=1 hands the kernels float8 tensors as before the fix and fails (no fp8e4nv on sm_86).
-  python tests/cpu_sm86_compile.py
+  python tests/cpu_sm86_compile.py      (QWEN_MLA_FP8_DECODE=asm|hoist|triton: all compile)
 """
 import os, sys
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -49,4 +49,10 @@ for small in (True, False):
                                        rms_bf16=mode == "bf16", rms_log8=mode == "log8")
             except Exception as e:
                 print(f"two-pass={small} {mode} {rank}: FAILED {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
-print("compiled for sm_86 with a uint8 cache:", sorted(set(seen)), f"({len(seen)} launches)")
+from qwen_mla.ops.mla_fp8_write import mla_fp8_cache_write
+for log8 in (True, False):                              # the one-launch FP8 cache write (no fp8 types at all)
+    cache = torch.zeros(4, 16, 1072, dtype=torch.float8_e4m3fn)
+    mla_fp8_cache_write(torch.zeros(8, 768, dtype=torch.bfloat16), torch.zeros(8, 256, dtype=torch.bfloat16), cache,
+                        torch.arange(8), torch.tensor(0.05), 232, 24, log8=log8)
+print("compiled for sm_86 with a uint8 cache:", sorted(set(seen)), f"({len(seen)} launches)",
+      "decode mode:", M._FP8_MODE)

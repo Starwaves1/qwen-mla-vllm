@@ -75,15 +75,61 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+# FP8 cache below SM89 (RTX 30xx). Triton has no fp8e4nv there, so decode_attention_fwd hands the
+# kernels the cache as uint8 and they decode e4m3 with bit operations only: _e4m3_f16 yields an fp16
+# holding value / 256 (exact), the dots run in fp16 against a q that the wrapper also scaled by 1/256,
+# and the 256s and the per-layer scale are applied once to the [heads, tokens] score tile and to the
+# output -- no float op per cache element.
+#
+# QWEN_MLA_FP8_DECODE picks how _e4m3_f16 is emitted (the result is identical):
+#   asm    (default) packed PTX, four codes per register, run where the tile is loaded from global
+#          memory (16 consecutive codes per thread); the fp16 tile then goes through shared memory to
+#          both dots exactly like a bf16 cache (ldmatrix, transposed for V = K^T).
+#   hoist  the same PTX marked pure, which lets Triton move it behind the shared-memory load into the
+#          MMA operand layout (half the shared-memory bytes, but V = K^T reduces across tokens, so
+#          every pair of codes is first gathered from two rows: ~2x the instructions per tile).
+#   triton plain Triton integer ops (Triton unpacks them byte by byte); used by the interpreter.
+# sm_86 SASS per 16-token tile at rank 768 (TP=1): bf16 cache 1264 instructions, asm 1144, hoist 2221,
+# triton 2997.
+import os as _os_fp8  # noqa: E402
+
+_FP8_MODE = "triton" if _os_fp8.environ.get("TRITON_INTERPRET") == "1" else \
+    _os_fp8.environ.get("QWEN_MLA_FP8_DECODE", "asm")
+assert _FP8_MODE in ("asm", "hoist", "triton"), f"QWEN_MLA_FP8_DECODE={_FP8_MODE!r}"
+_FP8_ASM = tl.constexpr(_FP8_MODE != "triton")
+_FP8_PURE = tl.constexpr(_FP8_MODE == "hoist")
+
+
+@triton.jit
+def _e4m3_f16(x):
+    """uint8 e4m3 codes -> fp16 equal to value / 256, exact for every finite code, subnormals included.
+
+    e4m3 is s.eeee.mmm with bias 7; fp16 is s.eeeee.mmmmmmmmmm with bias 15. Placing the code's 7
+    exponent/mantissa bits at fp16 bits 13..7 and its sign at bit 15 reads the same bits with a bias
+    8 larger, i.e. value / 2^8; e4m3 subnormals (exponent 0) land on fp16 subnormals, so they are
+    exact too. Sign-extending the byte to 16 bits and shifting left by 7 puts the sign at bit 15 (and
+    a copy at bit 14, cleared by the mask). The NaN codes 0x7F/0xFF decode to +-480: the cache write
+    saturates to +-448, so they occur only if the model itself produced NaN.
+    """
+    if _FP8_ASM:
+        # per pair of codes: one sign-extending byte permute, one shift, one mask
+        y = tl.inline_asm_elementwise(
+            "{ .reg .b32 a, b;\n"
+            " prmt.b32 a, $2, 0, 0x9180;\n"     # [sext(byte 1) | sext(byte 0)]
+            " prmt.b32 b, $2, 0, 0xB3A2;\n"     # [sext(byte 3) | sext(byte 2)]
+            " shl.b32 a, a, 7;\n shl.b32 b, b, 7;\n"
+            " and.b32 $0, a, 0xBF80BF80;\n and.b32 $1, b, 0xBF80BF80; }",
+            "=r,=r,r", [x], dtype=tl.float16, is_pure=_FP8_PURE, pack=4)
+    else:
+        y = ((x.to(tl.int8, bitcast=True).to(tl.int16) << 7) & -16512).to(tl.float16, bitcast=True)  # 0xBF80
+    return y
+
+
 @triton.jit
 def _fp8(x):
-    """An FP8 (e4m3) cache value as fp32. Triton has no fp8e4nv below SM89 (RTX 30xx), so there the
-    cache arrives as uint8 (decode_attention_fwd) and is decoded here: sign and the 7 exponent/mantissa
-    bits shift into an fp16 whose bias is 8 larger, times 2^8 -- exact for every finite e4m3 value,
-    subnormals included (the cache write saturates, so NaN codes never occur)."""
+    """An FP8 (e4m3) cache value as fp32 (uint8 codes below SM89, see _e4m3_f16)."""
     if x.dtype.is_uint8():
-        u = x.to(tl.uint16)
-        y = (((u & 0x80) << 8) | ((u & 0x7F) << 7)).to(tl.float16, bitcast=True).to(tl.float32) * 256.0
+        y = _e4m3_f16(x).to(tl.float32) * 256.0
     else:
         y = x.to(tl.float32)
     return y
@@ -353,6 +399,7 @@ def _fwd_grouped_kernel_stage1(
     cur_batch = tl.program_id(0)
     cur_head_id = tl.program_id(1)
     cur_kv_head = cur_head_id // tl.cdiv(kv_group_num, BLOCK_H)
+    U8: tl.constexpr = K_Buffer.dtype.element_ty == tl.uint8     # FP8 cache below SM89 (_e4m3_f16)
     split_kv_id = tl.program_id(2)
 
     VALID_BLOCK_H: tl.constexpr = BLOCK_H if kv_group_num > BLOCK_H else kv_group_num
@@ -462,8 +509,10 @@ def _fwd_grouped_kernel_stage1(
                 cache_modifier=".cg",
             )
 
-            if k.dtype.is_fp8() or k.dtype.is_uint8():
-                k = (_fp8(k) * ks).to(q.dtype)
+            if U8:
+                k = _e4m3_f16(k)
+            elif k.dtype.is_fp8():
+                k = (k.to(tl.float32) * ks).to(q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = kv_off_k[None, :] + base_offs_kpe
@@ -473,9 +522,13 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                     cache_modifier=".cg",
                 )
-                if kpe.dtype.is_fp8() or kpe.dtype.is_uint8():
-                    kpe = (_fp8(kpe) * ks).to(qpe.dtype)
+                if U8:
+                    kpe = _e4m3_f16(kpe)
+                elif kpe.dtype.is_fp8():
+                    kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            if U8:
+                qk *= ks * 65536.0                  # q and k both carried at 1/256
 
             if RMS_OFFSET >= 0:
                 # rms(key_h) lives in K_Buffer at [RMS_OFFSET + head] for each key token, so it
@@ -543,8 +596,10 @@ def _fwd_grouped_kernel_stage1(
                     mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
                     other=0.0,
                 )
-                if v.dtype.is_fp8() or v.dtype.is_uint8():
-                    v = (_fp8(v) * vs).to(q.dtype)
+                if U8:
+                    v = _e4m3_f16(v)
+                elif v.dtype.is_fp8():
+                    v = (v.to(tl.float32) * vs).to(q.dtype)
             elif MLA_RELOAD_V:
                 # Upstream reuses the K tile via tl.trans, reasoning that a second load of the
                 # same c_kv is unnecessary. But tl.trans of a [BLOCK_DMODEL, BLOCK_N] tile into
@@ -558,8 +613,10 @@ def _fwd_grouped_kernel_stage1(
                     other=0.0,
                     cache_modifier=".cg",
                 )
-                if v.dtype.is_fp8() or v.dtype.is_uint8():
-                    v = (_fp8(v) * ks).to(q.dtype)
+                if U8:
+                    v = _e4m3_f16(v)
+                elif v.dtype.is_fp8():
+                    v = (v.to(tl.float32) * ks).to(q.dtype)
             else:
                 # MLA uses a single c_kv.
                 # loading the same c_kv to interpret it as v is not necessary.
@@ -570,7 +627,10 @@ def _fwd_grouped_kernel_stage1(
             re_scale = tl.exp(e_max - n_e_max)
             p = tl.exp(qk - n_e_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if U8:
+                acc += tl.dot((p * 16384.0).to(tl.float16), v)    # 2^14 keeps small p out of fp16 subnormals
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -582,6 +642,8 @@ def _fwd_grouped_kernel_stage1(
             + offs_dv[None, :]
         )
 
+        if U8:
+            acc *= (ks if IS_MLA else vs) * (256.0 / 16384.0)       # v at 1/256, p at 2^14
         tl.store(
             Att_Out + offs_mid_o,
             acc / e_sum[:, None],
@@ -649,8 +711,10 @@ def _mla2p_scores_kernel(
                         mask=mh[:, None] & md[None, :], other=0.0, cache_modifier=".ca")
             k = tl.load(K_Buffer + kv_off[None, :] + offs_d[:, None],
                         mask=mn[None, :] & md[:, None], other=0.0, cache_modifier=".cg")
-            if k.dtype.is_fp8() or k.dtype.is_uint8():
-                k = _fp8(k) * ks
+            if k.dtype.is_uint8():
+                k = _e4m3_f16(k)
+            elif k.dtype.is_fp8():
+                k = k.to(tl.float32) * ks
             qk += tl.dot(q, k.to(q.dtype))
         if BLOCK_DPE > 0:
             offs_p = Lv + tl.arange(0, BLOCK_DPE)
@@ -659,9 +723,13 @@ def _mla2p_scores_kernel(
                           mask=mh[:, None] & mp[None, :], other=0.0, cache_modifier=".ca")
             kpe = tl.load(K_Buffer + kv_off[None, :] + offs_p[:, None],
                           mask=mn[None, :] & mp[:, None], other=0.0, cache_modifier=".cg")
-            if kpe.dtype.is_fp8() or kpe.dtype.is_uint8():
-                kpe = _fp8(kpe) * ks
+            if kpe.dtype.is_uint8():
+                kpe = _e4m3_f16(kpe)
+            elif kpe.dtype.is_fp8():
+                kpe = kpe.to(tl.float32) * ks
             qk += tl.dot(qpe, kpe.to(qpe.dtype))
+        if K_Buffer.dtype.element_ty == tl.uint8:
+            qk *= ks * 65536.0                      # q and k both carried at 1/256 (_e4m3_f16)
         if RMS_OFFSET >= 0:
             if RMS_LOG8:
                 rms_row = (K_Buffer + kv_off + RMS_OFFSET).to(tl.pointer_type(tl.uint8))
@@ -727,15 +795,22 @@ def _mla2p_pv_kernel(
             kv_off = page * stride_kp + ((start_n % PAGE_SIZE) + tl.arange(0, BLOCK_N)) * stride_kt
             v = tl.load(K_Buffer + kv_off[:, None] + offs_dv[None, :],
                         mask=mn[:, None] & mdv[None, :], other=0.0, cache_modifier=".cg")
-            if v.dtype.is_fp8() or v.dtype.is_uint8():
-                v = (_fp8(v) * tl.load(k_scale)).to(tl.bfloat16)
+            if v.dtype.is_uint8():
+                v = _e4m3_f16(v)
+            elif v.dtype.is_fp8():
+                v = (v.to(tl.float32) * tl.load(k_scale)).to(tl.bfloat16)
             n_max = tl.maximum(tl.max(sc, 1), e_max)
             re = tl.exp(e_max - n_max)
             pr = tl.exp(sc - n_max[:, None])
-            acc = acc * re[:, None] + tl.dot(pr.to(v.dtype), v)
+            if v.dtype.is_fp16():                   # uint8 cache: v at 1/256; 2^14 keeps small p normal
+                acc = acc * re[:, None] + tl.dot((pr * 16384.0).to(tl.float16), v)
+            else:
+                acc = acc * re[:, None] + tl.dot(pr.to(v.dtype), v)
             e_sum = e_sum * re + tl.sum(pr, 1)
             e_max = n_max
         base = b * stride_ob + heads * stride_oh + split * stride_os
+        if K_Buffer.dtype.element_ty == tl.uint8:
+            acc *= tl.load(k_scale) * (256.0 / 16384.0)
         o = acc / e_sum[:, None]
         lse = e_max + tl.log(e_sum)
         if MERGE:                     # fold this chunk into the partial from earlier rounds
@@ -857,6 +932,10 @@ def _decode_grouped_att_m_fwd(
     # product -- rel error 8.9e-2 against a control of 1.9e-3, i.e. degraded but plausible.
     Lk = k_buffer.shape[-1] if rms_offset < 0 else rms_offset
     Lv = v_buffer.shape[-1]
+    if k_buffer.dtype == torch.uint8:
+        # FP8 cache below SM89: the kernels take q as fp16 at 1/256 (see _e4m3_f16). The scale keeps any
+        # |q| < 2^24 in fp16 range; bf16 values >= 2^-9 convert exactly.
+        q = (q * 2**-8).to(torch.float16)
 
     # Wide MLA latents (1792) cannot fit the single-pass tiles in 99 KB of shared memory without
     # BLOCK_H 4, which re-reads the latent once per 4 heads; use the two-pass kernels instead.
