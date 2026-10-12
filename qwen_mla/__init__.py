@@ -218,6 +218,9 @@ def register():
     _inherit_qwen3_5_config_hook()
     _enable_mtp_draft()
     _fp8_kv_default_from_checkpoint()
+    # OffloadingConnector sync_load with MLA's per-group block sizes (1:2:4 pages): see offload_sync.py.
+    from . import offload_sync
+    offload_sync.apply()
 
 
 def _inherit_qwen3_5_config_hook():
