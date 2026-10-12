@@ -508,6 +508,15 @@ def _prefix_cache_scheduler_fixes():
         coord = getattr(getattr(self, "kv_cache_manager", None), "coordinator", None)
         if coord is None or not hasattr(coord, "attention_groups") or not any(a in ALL_ARCHS for a in archs):
             return
+        # In align mode every prefill chunk but a prompt's last is floored to the cache block, whose size
+        # depends on the KV dtype, TP size and MTP (1600 tokens on 2 GPUs with FP8 KV and MTP). A budget
+        # that is not a multiple of it leaves the remainder of every step's budget unused.
+        bs, mnst = self.cache_config.block_size, self.max_num_scheduled_tokens
+        if getattr(self, "need_mamba_block_aligned_split", False) and mnst > bs and mnst % bs:
+            lo = mnst // bs * bs
+            print(f"[qwen-mla] prefix caching: prefill chunks are multiples of the {bs}-token cache block, so "
+                  f"--max-num-batched-tokens {mnst} prefills only {lo} tokens per step; use {lo} or {lo + bs}",
+                  flush=True)
         from vllm.utils.math_utils import cdiv
         from vllm.v1.kv_cache_interface import FullAttentionSpec
         full = [gid for g in coord.attention_groups if isinstance(g.spec, FullAttentionSpec) for gid in g.group_ids]

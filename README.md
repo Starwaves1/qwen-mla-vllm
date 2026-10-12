@@ -100,10 +100,10 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw --tensor-parallel-size 2 -
 
 * `--max-num-seqs 8 --max-num-batched-tokens 3200` shrink the activation memory vLLM reserves before
   sizing the KV cache (40% more KV than vLLM's defaults in a text-only test). 3200 is two 1600-token
-  cache blocks: with prefix caching, prefill chunks end on block boundaries, so a budget that is not a
-  multiple of the block wastes the remainder of every chunk.
+  cache blocks (the block size on this setup): with prefix caching, prefill chunks end on block
+  boundaries, so a budget that is not a multiple of the block wastes the remainder of every chunk.
 * `--enable-prefix-caching --mamba-cache-mode align`: see [Prefix caching](#prefix-caching). Makes repeat
-  turns of an agent loop nearly free, for about 7% of the KV cache and ~15% of decode speed; drop it for
+  turns of an agent loop nearly free, for about 7% of the KV cache and ~15% of decode speed here; drop it for
   one-off long generations.
 * `--gpu-memory-utilization 0.88` leaves room for a desktop on the GPU that drives the display.
 * Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment (less fragmentation).
@@ -322,7 +322,10 @@ Measured on 2x RTX 5060 Ti, second turn of a two-turn conversation:
 
 Cached and uncached greedy answers to the same prompts match token for token up to near-ties (first-token
 logprobs within 0.06 of each other; two uncached runs differ by as much). When a new prompt extends an
-earlier one, the hit reaches to within 16 tokens of the earlier prompt's end. With MTP, use a `--max-num-batched-tokens` that is a multiple of 1600, the cache block (1568 without MTP).
+earlier one, the hit reaches to within 16 tokens of the earlier prompt's end. Give `--max-num-batched-tokens` a multiple of the cache block: prefill chunks are floored to it, so 3000
+on a 1600-token block prefills 1600 per step. The block size depends on the KV dtype, the TP size and MTP
+(1600 on two GPUs with FP8 KV and MTP, 1568 without MTP); the worker log prints it (`Setting attention block
+size to N tokens`), and the plugin warns at startup when the budget is not a multiple.
 
 The cost is decode speed: align mode updates the linear-attention state bookkeeping every step. With MTP
 k=3 on 2x RTX 5060 Ti, six greedy prompts averaged 67.5 tok/s with prefix caching and 78.8 without, and

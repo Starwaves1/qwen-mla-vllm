@@ -47,8 +47,10 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 * Tool calling (agent harnesses): `--enable-auto-tool-choice --tool-call-parser qwen3_coder`.
 * Agent loops, chat, or a long shared system prompt: add `--enable-prefix-caching --mamba-cache-mode align`
   so repeated prefixes are not prefilled again (a 37.7k-token second turn: 52 s -> 0.6 s to first token).
-  Costs ~7% of KV capacity and ~15% of decode speed. Give `--max-num-batched-tokens` a multiple of the cache block (1600 with MTP,
-  1568 without; the log prints it). Do not set `--prefix-match-unit`; the plugin picks it.
+  Costs ~7% of KV capacity and ~15% of decode speed (measured on 2x RTX 5060 Ti). Give `--max-num-batched-tokens` a multiple of
+  the cache block, which varies with KV dtype, TP size and MTP (1600 on 2 GPUs, FP8 KV, MTP); if it is not, the plugin prints
+  `[qwen-mla] prefix caching: prefill chunks are multiples of ...` with the values to use. Do not set `--prefix-match-unit`;
+  the plugin picks it.
 * The models accept images like the base model. If the user only needs text, add
   `--limit-mm-per-prompt '{"image": 0, "video": 0}'`.
 * Pick the weight format by VRAM per GPU (MLA for 1 GPU, GLA-g2 for 2):
@@ -95,7 +97,7 @@ The answer should contain `391`. In the server log, check for:
 | hang or `custom_all_reduce ... invalid argument` at TP>1 | add `--disable-custom-all-reduce` |
 | `flashinfer path unavailable (... nvcc ...)` | install the CUDA toolkit (matching the driver) and `ninja`, then restart; or accept the Triton path |
 | `the shipped kernel headers target flashinfer X, installed is Y` | a different flashinfer was installed; reinstall in a fresh venv |
-| out of memory at startup | lower `--max-model-len` or `--gpu-memory-utilization`; on 16-24 GB GPUs add `--max-num-seqs 8 --max-num-batched-tokens 2048` |
+| out of memory at startup | lower `--max-model-len` or `--gpu-memory-utilization`; on 16-24 GB GPUs add `--max-num-seqs 8 --max-num-batched-tokens 2048` (with prefix caching, a multiple of the cache block instead, e.g. 1600) |
 | `To serve at least one request with the model's max seq len ... KV cache is needed` | the KV cache cannot hold one `--max-model-len` sequence; lower it, drop MTP, or set `--limit-mm-per-prompt '{"image": 0, "video": 0}'` |
 | `FlashInfer requires GPUs with sm75 or higher` on an RTX 50-series GPU | misleading: FlashInfer's JIT found an `nvcc` too old for sm_120. Put CUDA >= 12.8 first on `PATH` and set `CUDA_HOME` |
 | `ptxas ... Unsupported .version` while building cuda-exl3 | mixed CUDA versions in the pip toolkit (`nvidia-nvvm` newer than `nvidia-cuda-nvcc`); pin all to the same minor version |
