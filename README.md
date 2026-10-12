@@ -93,28 +93,41 @@ Two 16 GB GeForce cards (tested: 2x RTX 5060 Ti, PCIe, no NVLink) serve the grou
 ```bash
 vllm serve TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw --tensor-parallel-size 2 --disable-custom-all-reduce \
   --reasoning-parser qwen3 --max-model-len 262144 --gpu-memory-utilization 0.88 \
-  --max-num-seqs 8 --max-num-batched-tokens 2048 --limit-mm-per-prompt '{"image": 1, "video": 0}' \
-  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+  --max-num-seqs 8 --max-num-batched-tokens 3200 --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+  --enable-prefix-caching --mamba-cache-mode align
 ```
 
-* `--max-num-seqs 8 --max-num-batched-tokens 2048` shrink the activation memory vLLM reserves before
-  sizing the KV cache (40% more KV than vLLM's defaults in a text-only test).
+* `--max-num-seqs 8 --max-num-batched-tokens 3200` shrink the activation memory vLLM reserves before
+  sizing the KV cache (40% more KV than vLLM's defaults in a text-only test). 3200 is two 1600-token
+  cache blocks: with prefix caching, prefill chunks end on block boundaries, so a budget that is not a
+  multiple of the block wastes the remainder of every chunk.
+* `--enable-prefix-caching --mamba-cache-mode align`: see [Prefix caching](#prefix-caching). Makes repeat
+  turns of an agent loop nearly free, for about 7% of the KV cache and ~15% of decode speed; drop it for
+  one-off long generations.
 * `--gpu-memory-utilization 0.88` leaves room for a desktop on the GPU that drives the display.
 * Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment (less fragmentation).
 
-Measured (FP8 KV, the default for this build; 8.7 GiB of weights per GPU):
+Measured (FP8 KV, the default for this build; 8.7 GiB of weights per GPU; decode without prefix caching):
 
 | | KV cache | 262k sequences | decode, short prompt | decode, 9k prompt + 2k-token story | decode at 29k context |
 |---|---|---|---|---|---|
-| no MTP | 463k tokens | 1.77 | 36 tok/s | 36 tok/s | 34 tok/s |
-| MTP, k=3 | 305k tokens | 1.16 | 68-75 tok/s | 56-58 tok/s | 48 tok/s |
+| no MTP | 463k tokens (432k with prefix caching) | 1.77 | 36 tok/s | 36 tok/s | 34 tok/s |
+| MTP, k=3 | 305k tokens (283k with prefix caching) | 1.16 | 68-75 tok/s | 56-58 tok/s | 48 tok/s |
 
 A 251k-token prompt with an image attached ran to completion (needle and image both answered correctly),
 peaking at 14.8 / 14.1 GB per GPU. Prefill is about 750 tokens/s and slows with context (251k tokens took
-9 minutes); vLLM has no prefix caching for this hybrid architecture, so an agent loop pays it on every turn.
+9 minutes). With prefix caching, the next turn of a conversation only prefills what is new: a 37.7k-token
+second turn started answering after 0.6 s instead of 52 s.
 
 Home-hardware notes:
 
+* **Prefill speed is bound by the link between the GPUs.** GeForce cards cannot reach each other's memory
+  directly, so tensor parallelism all-reduces through host memory over PCIe. With one card in a chipset
+  slot (PCIe 3.0 x4 on the tested B660 board, 3.6 GB/s) the all-reduce took ~48% of prefill time;
+  the GPUs drew ~100 W of their 150 W cap and raising the cap to 180 W changed nothing. A second slot
+  wired to the CPU (x8/x8 boards, or an M.2-to-PCIe adapter in a CPU-attached M.2 slot) is the fix;
+  `--max-num-batched-tokens` above 3200 did not help.
 * **Tool calling** for agent harnesses: `--enable-auto-tool-choice --tool-call-parser qwen3_coder`.
 * **Streaming with MTP** delivers one chunk per decode step, carrying all tokens accepted in it (about 2-3).
   A client that counts chunks as tokens reports the step rate, roughly half the real speed.
@@ -215,6 +228,11 @@ with spec decode. 0.6.0 keeps full graphs (the draft layer runs on Triton), and 
 GLA-g2-EXL3 build now gains 1.6-2.1x from k=3 (see [16 GB GPUs](#16-gb-gpus)). The RTX PRO 6000 FP8-cache
 numbers have not been re-measured; measure on your hardware.
 
+Plugin versions 0.6.0 and earlier with MTP give garbage output for a prompt whose last prefill chunk is
+exactly 1 + k tokens (k=3: e.g. 3204 tokens at `--max-num-batched-tokens 3200`) when it runs alone: vLLM
+picks the full decode CUDA graph by batch shape and replays spec-decode kernels on prompt tokens.
+Upgrade to 0.6.1.
+
 ### Vision
 
 Paired against the base model on the same items, greedy, thinking off (300 ChartQA test questions, relaxed
@@ -265,6 +283,9 @@ With MTP and an FP8 cache, also expect `[qwen-mla] MTP draft attention -> TRITON
 decode runs well below its speed (an explicit `attention_backend` in `--speculative-config` overrides
 the plugin's choice).
 
+With prefix caching, expect `[qwen-mla] prefix caching: hits land on 16-token boundaries`; the server's
+periodic stats line reports `Prefix cache hit rate`.
+
 Kernel correctness tests (need a GPU):
 
 ```bash
@@ -273,6 +294,40 @@ python tests/test_two_pass_1792.py
 python tests/test_decode_numerics.py
 python tests/test_mrope.py          # CPU only
 ```
+
+## Prefix caching
+
+`--enable-prefix-caching --mamba-cache-mode align` reuses the KV cache and linear-attention state of a
+prompt prefix that an earlier request already computed: the system prompt, and in an agent loop or chat,
+everything up to the newest message. vLLM marks this mode experimental for hybrid models. The plugin fixes
+three problems vLLM 0.27.1 has with it on these architectures (all automatic):
+
+* GLA-g2's MLA layers come in three latent widths, which vLLM gives different block sizes (1x, 2x, 4x the
+  cache block). Hits were rounded down to the largest, so a 16k-token second turn reused only 12.5k tokens.
+  The plugin sets `--prefix-match-unit 16`, which lets hits land inside a block and makes the scheduler
+  keep the linear-attention state at the end of every prompt.
+* With MTP, vLLM shortened every hit by a block in every layer group (6.4k of 15.6k tokens reused).
+  The plugin turns that off: it protects only the drafter's proposals, which the model verifies anyway.
+* With several full-attention groups and a hit shortened by the linear-attention layers, vLLM trimmed
+  only one group's blocks; the next partial hit crashed the engine (`AssertionError` in `_apply_cow`).
+
+Measured on 2x RTX 5060 Ti, second turn of a two-turn conversation:
+
+| | prompt | reused | time to first token |
+|---|---|---|---|
+| MTP k=3, before | 15.7k | 6.4k | 12.4 s |
+| MTP k=3 | 15.7k | 15.6k | 2.1 s |
+| MTP k=3 | 37.7k | 37.7k | 0.6 s (turn 1: 52 s) |
+| no MTP | 15.7k | 15.6k | 0.4 s (was 4.3 s) |
+
+Cached and uncached greedy answers to the same prompts match token for token up to near-ties (first-token
+logprobs within 0.06 of each other; two uncached runs differ by as much). When a new prompt extends an
+earlier one, the hit reaches to within 16 tokens of the earlier prompt's end. With MTP, use a `--max-num-batched-tokens` that is a multiple of 1600, the cache block (1568 without MTP).
+
+The cost is decode speed: align mode updates the linear-attention state bookkeeping every step. With MTP
+k=3 on 2x RTX 5060 Ti, six greedy prompts averaged 67.5 tok/s with prefix caching and 78.8 without, and
+decode at 7k context ran 45 vs 55 tok/s. It pays off whenever prompts repeat (agent loops, chat, a long
+system prompt); for single long generations from fresh prompts, leave it off.
 
 ## Limitations
 

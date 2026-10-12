@@ -221,6 +221,8 @@ def register():
     _mtp_draft_attention_backend()
     _spec_decode_graph_capture_fix()
     _fp8_kv_default_from_checkpoint()
+    _prefix_cache_hit_granularity()
+    _prefix_cache_scheduler_fixes()
 
 
 def _profile_prefill_context_scratch():
@@ -414,6 +416,121 @@ def _spec_decode_graph_capture_fix():
         return orig(self, num_tokens, *args, **kwargs)
     _dummy_run._qwen_mla_spec = True
     GPUModelRunner._dummy_run = _dummy_run
+
+    # The converse case at run time. vLLM picks the FULL "uniform decode" graph from the batch SHAPE
+    # alone (every request scheduled exactly 1 + k tokens), so a prefill chunk of exactly 1 + k tokens
+    # -- the tail of a prompt -- replays the graph captured above for spec-decode rows, and GDN runs its
+    # verification kernels on prompt tokens: garbage from the first output token. Measured with MTP k=3
+    # on a 20-token prompt split 16 + 4 by prefix caching; any prompt whose last chunk is 4 tokens
+    # (e.g. 3204 tokens at --max-num-batched-tokens 3200) hits it too. Such batches now take the
+    # mixed (PIECEWISE) path, where GDN's metadata builder sees the row as a prefill.
+    orig_prepare = GPUModelRunner._prepare_inputs
+    orig_determine = GPUModelRunner._determine_batch_execution_and_padding
+
+    def _prepare_inputs(self, scheduler_output, *args, **kwargs):
+        if self.speculative_config is not None:
+            archs = list(getattr(self.model_config, "architectures", None) or [])
+            if any(a in ALL_ARCHS for a in archs):
+                sd = scheduler_output.scheduled_spec_decode_tokens
+                self._qwen_mla_all_spec = all(len(sd.get(r, ())) + 1 == n
+                                              for r, n in scheduler_output.num_scheduled_tokens.items())
+        return orig_prepare(self, scheduler_output, *args, **kwargs)
+
+    def _determine_batch_execution_and_padding(self, *args, **kwargs):
+        if kwargs.get("force_uniform_decode") is None and getattr(self, "_qwen_mla_all_spec", True) is False:
+            kwargs["force_uniform_decode"] = False
+        self._qwen_mla_all_spec = True           # one-shot: dummy and capture runs never see a stale flag
+        return orig_determine(self, *args, **kwargs)
+    GPUModelRunner._prepare_inputs = _prepare_inputs
+    GPUModelRunner._determine_batch_execution_and_padding = _determine_batch_execution_and_padding
+
+
+def _prefix_cache_hit_granularity():
+    """Default --prefix-match-unit for prefix caching (--mamba-cache-mode align) on our architectures.
+
+    GLA-g2's MLA layers have different latent widths, and vLLM equalises their page sizes by giving each
+    width its own block size: 1x, 2x and 4x the cache block (1600/3200/6400 tokens with MTP, 1568/3136/
+    6272 without). With the default hash unit (the GCD = the cache block, which is also the linear-
+    attention block) vLLM sees no unit finer than a GDN block and rounds every hit to the LCM -- 4 cache
+    blocks. A 16k-token second turn reused 12.5k tokens without MTP and 6.4k with it (one 6400-token
+    block lost to the Eagle drop, see below). A unit finer than the GDN block switches on vLLM's partial
+    hits: full-attention groups match inside a block, and the scheduler ends one prefill chunk at the
+    prompt's last unit boundary so the GDN state there is kept. The unit only sets where hits may land
+    (one hash per unit), not how often state is stored. An explicit --prefix-match-unit wins.
+    """
+    from vllm.model_executor.models.config import HybridAttentionMambaModelConfig
+    if getattr(HybridAttentionMambaModelConfig.verify_and_update_config, "_qwen_mla_pmu", False):
+        return
+    orig = HybridAttentionMambaModelConfig.verify_and_update_config.__func__
+
+    def verify_and_update_config(cls, vllm_config):
+        orig(cls, vllm_config)
+        cc = vllm_config.cache_config
+        archs = list(getattr(vllm_config.model_config, "architectures", None) or [])
+        if (any(a in ALL_ARCHS for a in archs) and cc.enable_prefix_caching
+                and cc.mamba_cache_mode == "align" and cc.prefix_match_unit is None):
+            import sys
+            cc.prefix_match_unit = 16        # hybrid block sizes (set later, at KV init) are multiples of 16
+            print("[qwen-mla] prefix caching: hits land on 16-token boundaries", file=sys.stderr, flush=True)
+    verify_and_update_config._qwen_mla_pmu = True
+    HybridAttentionMambaModelConfig.verify_and_update_config = classmethod(verify_and_update_config)
+
+
+def _prefix_cache_scheduler_fixes():
+    """Two fixes to vLLM's hybrid prefix-cache lookup, applied to the scheduler of our architectures.
+
+    1. Trim every full-attention group to the reconciled hit. vLLM looks a hit up group by group and
+       shrinks it to what all groups can serve (the GDN layers only have state at chunk ends), then trims
+       only the FIRST full-attention group's block list. GLA-g2 has four full-attention groups (three MLA
+       latent widths with their own block sizes, plus the MTP layer), so the others kept blocks past the
+       hit: the request's block table then holds shared cached blocks where it will write fresh KV, and
+       with partial hits (see _prefix_cache_hit_granularity) the copy-on-write redirect asserts on the
+       wrong tail block and kills the engine (single_type_kv_cache_manager._apply_cow).
+
+    2. With MTP, keep the Eagle drop from shortening every hit. vLLM drops the last matched unit of a hit
+       because the draft layer's KV at its last position was computed from the token AFTER it, which a
+       new request may not share. When no KV-cache group is flagged as the drafter's (only DeepSeek-V4's
+       is), vLLM applies the drop to EVERY group. Here that pushed the hit below the GDN state at the
+       prompt tail and lost 2-3 prefill chunks per turn (16k turn 2: 12.8k reused instead of 15.6k), and
+       before the finer hit unit a whole 6400-token block. The drop guards draft quality only: the MTP
+       layer's KV feeds proposals that the target model verifies, so a stale draft entry at one position
+       can cost some acceptance at worst, never change output; and the drafter computes its KV for every
+       scheduled position in the step that schedules it, so a hit never reads uncomputed draft KV.
+    """
+    from vllm.v1.core.sched.scheduler import Scheduler
+    if getattr(Scheduler.__init__, "_qwen_mla_pc", False):
+        return
+    orig = Scheduler.__init__
+
+    def __init__(self, *args, **kwargs):
+        orig(self, *args, **kwargs)
+        archs = list(getattr(self.vllm_config.model_config, "architectures", None) or [])
+        coord = getattr(getattr(self, "kv_cache_manager", None), "coordinator", None)
+        if coord is None or not hasattr(coord, "attention_groups") or not any(a in ALL_ARCHS for a in archs):
+            return
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.kv_cache_interface import FullAttentionSpec
+        full = [gid for g in coord.attention_groups if isinstance(g.spec, FullAttentionSpec) for gid in g.group_ids]
+        find = coord.find_longest_cache_hit
+
+        def find_longest_cache_hit(*a, **k):
+            out = find(*a, **k)
+            blocks, hit_length = out[0], out[1]
+            for gid in full:
+                del blocks[gid][cdiv(hit_length, coord.single_type_managers[gid].block_size):]
+            return out
+        coord.find_longest_cache_hit = find_longest_cache_hit
+
+        spec = self.vllm_config.speculative_config
+        if spec is not None and getattr(spec, "method", None) == "mtp":
+            self.kv_cache_manager.use_eagle = False
+            if hasattr(coord, "eagle_group_ids"):
+                coord.eagle_group_ids = set()
+            coord.attention_groups = [g._replace(use_eagle=False) for g in coord.attention_groups]
+            for m in coord.single_type_managers:
+                m.use_eagle = False
+    __init__._qwen_mla_pc = True
+    Scheduler.__init__ = __init__
 
 
 def _fp8_kv_default_from_checkpoint():
