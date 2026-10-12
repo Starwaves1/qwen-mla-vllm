@@ -289,6 +289,19 @@ class QwenMLATritonImpl(TritonMLAImpl):
 
     mla_kv_fp8: bool = False        # FP8 cache: rms tail stored as raw bf16 bytes after the rope block
 
+    def __init__(self, *args, **kwargs):
+        # vLLM refuses an FP8 cache for the Triton MLA backend below SM89 (Triton has no fp8e4nv there).
+        # This backend's kernels decode e4m3 themselves on those GPUs (ops/mla_decode_attention._fp8), so
+        # finish the two assignments the refusal skipped; everything before it in __init__ already ran.
+        try:
+            super().__init__(*args, **kwargs)
+        except ValueError as e:
+            if "FP8 KV cache is not supported by the Triton MLA backend" not in str(e):
+                raise
+            from vllm.platforms import current_platform
+            self.supports_quant_query_input = False
+            self._sm_count = current_platform.num_compute_units()
+
     def _mla_kernel(self, *args, **kwargs):
         kwargs["rms_offset"] = self.rms_offset
         kwargs["rms_bf16"] = self.mla_kv_fp8 and mla_fp8_rms_bf16()
