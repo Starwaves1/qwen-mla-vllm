@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import torch
 
+_DEQUANT_SLICE = 8192   # rows per FP8 dequant slice (see the FP8 branch)
+
 
 def gather_cache_torch(*, src_cache: torch.Tensor, dst: torch.Tensor,
                        block_table: torch.Tensor, cu_seq_lens: torch.Tensor,
@@ -49,19 +51,26 @@ def gather_cache_torch(*, src_cache: torch.Tensor, dst: torch.Tensor,
     # FP8 row: [latent | rope] e4m3 (x scale) then the rms tail as raw bf16 (2 bytes per head). The
     # destination is the bf16 workspace the prefill path splits on the BF16 layout, where rms sits at
     # rms_offset as one element per head -- so decode into exactly that.
+    #
+    # Dequantized in slices: the fp32 intermediates cost ~10 bytes per latent element, so one pass over
+    # a 64k-row chunk is several hundred MB of transient on top of the workspace -- unaccounted by vLLM's
+    # profile run, it is what ran 16 GB cards out of memory mid-prefill. Slicing keeps results identical.
     off, nh = mla_rms[:2]
     mode = mla_rms[2] if len(mla_rms) > 2 else "bf16"
-    rows = src_cache.view(torch.uint8)[blk, tok % block_size].reshape(num_tokens, -1)
-    if mode == "log8":                     # rms as a uint8 code of log2(rms)
-        from ..mla_impl import RMS_LOG2_HI, RMS_LOG2_LO
-        dst[:num_tokens, :off].copy_((rows[:, :off].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
-        code = rows[:, off:off + nh].float()
-        dst[:num_tokens, off:off + nh].copy_(
-            torch.exp2(RMS_LOG2_LO + code * ((RMS_LOG2_HI - RMS_LOG2_LO) / 255.0)).to(dst.dtype))
-        return
-    if mode == "e4m3":                     # compact: the whole row (rms included) is e4m3 x scale
-        dst[:num_tokens, :off + nh].copy_(
-            (rows[:, :off + nh].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
-        return
-    dst[:num_tokens, :off].copy_((rows[:, :off].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
-    dst[:num_tokens, off:off + nh].copy_(rows[:, off:off + 2 * nh].contiguous().view(torch.bfloat16).to(dst.dtype))
+    u8 = src_cache.view(torch.uint8)
+    for a in range(0, num_tokens, _DEQUANT_SLICE):
+        b = min(a + _DEQUANT_SLICE, num_tokens)
+        bk, tk = blk[a:b], tok[a:b] % block_size
+        rows = u8[bk, tk].reshape(b - a, -1)
+        out = dst[a:b]
+        if mode == "e4m3":                 # compact: the whole row (rms included) is e4m3 x scale
+            out[:, :off + nh].copy_((rows[:, :off + nh].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
+            continue
+        out[:, :off].copy_((rows[:, :off].view(torch.float8_e4m3fn).float() * scale.float()).to(dst.dtype))
+        if mode == "log8":                 # rms as a uint8 code of log2(rms)
+            from ..mla_impl import RMS_LOG2_HI, RMS_LOG2_LO
+            code = rows[:, off:off + nh].float()
+            out[:, off:off + nh].copy_(
+                torch.exp2(RMS_LOG2_LO + code * ((RMS_LOG2_HI - RMS_LOG2_LO) / 255.0)).to(dst.dtype))
+        else:
+            out[:, off:off + nh].copy_(rows[:, off:off + 2 * nh].contiguous().view(torch.bfloat16).to(dst.dtype))

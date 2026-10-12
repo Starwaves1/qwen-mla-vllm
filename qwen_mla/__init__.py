@@ -215,9 +215,60 @@ def register():
     for old, new in LEGACY_ARCHS.items():
         ModelRegistry.register_model(old, ARCHS[new])
     _skip_cudagraph_memory_profiling_if_unwanted()
+    _profile_prefill_context_scratch()
     _inherit_qwen3_5_config_hook()
     _enable_mtp_draft()
+    _mtp_draft_attention_backend()
+    _spec_decode_graph_capture_fix()
     _fp8_kv_default_from_checkpoint()
+
+
+def _profile_prefill_context_scratch():
+    """Make the profile run see the whole per-chunk scratch of a long-context prefill.
+
+    vLLM sizes the KV cache from the peak memory of a profile forward, in which every MLA layer
+    stands in for the context-chunk path by allocating the kv_b_proj output alone:
+    [workspace rows, heads, nope + v]. The real path holds more at once: the assembled key
+    [rows, heads, nope + rope], the per-head rope selection feeding it [rows, heads, rope], and
+    FLASH_ATTN's copy of v padded to the key width [rows, heads, nope + rope]. Measured on a GLA-g2
+    rank with 64k rows: 1.89 GB real vs 0.68 GB simulated -- the KV cache took the difference and the
+    first prompt past ~50k tokens ran out of memory, on any GPU whose budget was tight enough to notice
+    (16 GB cards first). Allocating those (plus one FP8 dequant slice and a measured margin) alongside
+    the parent's stand-in makes the profiled peak cover the real one, so the KV budget is right by
+    construction rather than by --kv-cache-memory-bytes.
+    """
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+    if getattr(MLAAttention.forward_impl, "_qwen_mla", False):
+        return
+    orig = MLAAttention.forward_impl
+
+    def forward_impl(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, *args, **kwargs):
+        if attn_metadata is not None or getattr(self.impl, "rms_offset", -1) < 0:
+            return orig(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, *args, **kwargs)
+        import torch
+        rows, heads = self.chunked_prefill_workspace_size, self.num_heads
+        kw = self.qk_nope_head_dim + getattr(self.impl, "mla_rope_dim", self.qk_rope_head_dim)
+        dev, dt = k_c_normed.device, k_c_normed.dtype
+        held = [torch.empty((rows, heads, kw), device=dev, dtype=dt),            # assembled key
+                torch.empty((rows, heads, kw - self.qk_nope_head_dim), device=dev, dtype=dt),  # rope sel
+                torch.empty((rows, heads, max(kw, self.v_head_dim)), device=dev, dtype=dt)]   # padded v
+        if getattr(self.impl, "mla_kv_fp8", False):
+            # One FP8 dequant slice of the gather (fp32 intermediates, ~10 bytes per element). It is not
+            # live at the same moment as the key above; counting both keeps the estimate an upper bound.
+            from .ops.mla_gather import _DEQUANT_SLICE
+            held.append(torch.empty((min(rows, _DEQUANT_SLICE), self.head_size * 10), device=dev, dtype=torch.uint8))
+        # Margin for the query-side and indexing temporaries of the same call (prefill output, softmax lse,
+        # merge buffers, gather indices): measured peak 499 MiB vs 445 MiB from the terms above at the
+        # widest GLA-g2 layer, 15k rows.
+        sim = rows * heads * (self.qk_nope_head_dim + self.v_head_dim) * dt.itemsize
+        held.append(torch.empty(int(0.2 * (sim + sum(t.numel() * t.element_size() for t in held))),
+                                device=dev, dtype=torch.uint8))
+        try:
+            return orig(self, q, k_c_normed, k_pe, kv_cache, attn_metadata, *args, **kwargs)
+        finally:
+            del held
+    forward_impl._qwen_mla = True
+    MLAAttention.forward_impl = forward_impl
 
 
 def _inherit_qwen3_5_config_hook():
@@ -269,6 +320,100 @@ def _enable_mtp_draft():
     _ORIG_HF_CONFIG_OVERRIDE = SpeculativeConfig.hf_config_override
     SpeculativeConfig.hf_config_override = staticmethod(_mtp_hf_config_override)
     SpeculativeConfig._qwen_mla_mtp = True
+
+
+def _mtp_draft_attention_backend():
+    """Keep FULL decode CUDA graphs with MTP: put the draft's attention on Triton when vLLM would pick FlashInfer.
+
+    The MTP head has one standard-attention layer, and vLLM auto-selects its backend independently of
+    the target's (`speculative_config.attention_backend`, NOT the global --attention-backend). With an
+    FP8 KV cache outside Hopper, FLASH_ATTN is ruled out and FLASHINFER wins -- whose CUDA-graph support
+    with spec decode is single-token only, and vLLM lowers the whole engine to that common denominator:
+
+        CUDAGraphMode.FULL_AND_PIECEWISE is not supported with spec-decode for attention backend
+        FlashInferBackend ...; setting cudagraph_mode=PIECEWISE
+
+    so every attention call of the TARGET runs outside the graph, every step. TRITON_ATTN supports full
+    graphs with spec decode; for one draft layer its kernel speed is immaterial. Measured on 2x RTX 5060 Ti
+    (GLA-g2 EXL3, TP=2, MTP x3, 9k-token prompt): 47 -> 60 tok/s decode, identical acceptance.
+
+    Only that case is changed: bf16 KV (FLASH_ATTN available) and Hopper are left to vLLM. An explicit
+    `attention_backend` in --speculative-config always wins; QWEN_MLA_MTP_DRAFT_BACKEND=auto disables
+    this, any other value names the backend to force.
+    """
+    import os, sys
+    from vllm.v1.spec_decode import llm_base_proposer as _p
+    cls = _p.SpecDecodeBaseProposer
+    if getattr(cls._create_draft_vllm_config, "_qwen_mla", False):
+        return
+    orig = cls._create_draft_vllm_config
+
+    def _create_draft_vllm_config(self):
+        spec = self.speculative_config
+        want = os.environ.get("QWEN_MLA_MTP_DRAFT_BACKEND", "").strip()
+        if spec is not None and spec.attention_backend is None and want.lower() != "auto":
+            archs = list(getattr(self.vllm_config.model_config, "architectures", None) or [])
+            if any(a in ALL_ARCHS for a in archs) and getattr(spec, "method", None) == "mtp":
+                pick = want or None
+                if pick is None:
+                    from vllm.platforms import current_platform
+                    fp8 = str(self.vllm_config.cache_config.cache_dtype).startswith("fp8")
+                    if fp8 and not current_platform.is_device_capability_family(90):
+                        pick = "TRITON_ATTN"
+                if pick:
+                    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+                    spec.attention_backend = AttentionBackendEnum[pick.upper()]
+                    print(f"[qwen-mla] MTP draft attention -> {pick.upper()} (keeps FULL decode CUDA graphs; "
+                          "QWEN_MLA_MTP_DRAFT_BACKEND=auto to leave it to vLLM)", file=sys.stderr, flush=True)
+        return orig(self)
+    _create_draft_vllm_config._qwen_mla = True
+    cls._create_draft_vllm_config = _create_draft_vllm_config
+
+
+def _spec_decode_graph_capture_fix():
+    """Capture spec-decode CUDA graphs with the linear-attention layers in spec-decode mode.
+
+    GDN's metadata builder tells speculative rows (1 + k tokens each) from prefills by
+    `num_decode_draft_tokens_cpu`, which the model runner fills from the scheduler -- but only for real
+    steps. Capture goes through _dummy_run, which never touches the buffer, so it reads all zeros: the
+    uniform (1 + k)-token decode batch being captured is classified as PREFILLS. The builder then takes
+    the chunked-prefill branch, including a host-to-device copy that is illegal inside stream capture:
+
+        torch.AcceleratorError: CUDA error: invalid argument   (gdn_attn.py build -> async_tensor_h2d)
+
+    and when capture does go through, the replayed graph holds prefill-path kernels and buffers for what
+    are spec-decode rows at run time -- measured as an intermittent startup crash and a mid-generation
+    "unspecified launch failure". Reached whenever a GDN model is served with spec decode under FULL
+    decode graphs, i.e. any attention backend with full spec-decode graph support (FLASH_ATTN with a bf16
+    cache, or the Triton draft above). vLLM's stock Qwen3.5 has the same exposure; this is scoped to our
+    architectures.
+
+    Fix: before each dummy run, describe its rows the way the scheduler would -- a uniform-decode
+    batch of (1 + k)-token rows is k drafts per request, one accepted token -- and everything else
+    as non-speculative (-1).
+    """
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    if getattr(GPUModelRunner._dummy_run, "_qwen_mla_spec", False):
+        return
+    orig = GPUModelRunner._dummy_run
+
+    def _dummy_run(self, num_tokens, *args, **kwargs):
+        if self.speculative_config is not None and hasattr(self, "num_decode_draft_tokens"):
+            archs = list(getattr(self.model_config, "architectures", None) or [])
+            if any(a in ALL_ARCHS for a in archs):
+                uniform = kwargs.get("uniform_decode", args[2] if len(args) > 2 else False)
+                qlen = self.uniform_decode_query_len
+                self.num_decode_draft_tokens.np[:] = -1
+                if uniform and qlen > 1:
+                    reqs = min(self.scheduler_config.max_num_seqs, -(-num_tokens // qlen))
+                    self.num_decode_draft_tokens.np[:reqs] = qlen - 1
+                    if num_tokens % qlen:
+                        self.num_decode_draft_tokens.np[reqs - 1] = num_tokens % qlen - 1
+                    self.num_accepted_tokens.np[:reqs] = 1
+                    self.num_accepted_tokens.copy_to_gpu()
+        return orig(self, num_tokens, *args, **kwargs)
+    _dummy_run._qwen_mla_spec = True
+    GPUModelRunner._dummy_run = _dummy_run
 
 
 def _fp8_kv_default_from_checkpoint():

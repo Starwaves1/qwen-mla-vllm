@@ -108,13 +108,25 @@ def run(batch, heads, ctx, rank, rope, mode):
                        token_to_seq=torch.zeros(n, dtype=torch.int32, device=dev), num_tokens=n,
                        kv_cache_dtype="fp8", scale=scale, seq_starts=torch.tensor([123], device=dev),
                        mla_rms=(rank + rope, heads, mode))
+    # The FP8 dequant runs in slices; ragged slices crossing page boundaries must give the same rows exactly.
+    import qwen_mla.ops.mla_gather as mg
+    full, mg._DEQUANT_SLICE = mg._DEQUANT_SLICE, 37
+    try:
+        dst2 = torch.zeros_like(dst)
+        gather_cache_torch(src_cache=cache, dst=dst2, block_table=bt[:1], cu_seq_lens=cu,
+                           token_to_seq=torch.zeros(n, dtype=torch.int32, device=dev), num_tokens=n,
+                           kv_cache_dtype="fp8", scale=scale, seq_starts=torch.tensor([123], device=dev),
+                           mla_rms=(rank + rope, heads, mode))
+    finally:
+        mg._DEQUANT_SLICE = full
+    sliced_ok = torch.equal(dst, dst2)
     toks = torch.arange(123, 123 + n, device=dev)
     pages, offs = bt[0, toks // PAGE].long(), toks % PAGE
     exp = torch.cat([dl[pages, offs], dr[pages, offs], rq[pages, offs]], -1)
     e_g = ((dst[:, :rank + rope + heads].float() - exp).abs().max() / exp.abs().max()).item()
-    ok = e_k < 2e-2 and e_g < 1e-2
+    ok = e_k < 2e-2 and e_g < 1e-2 and sliced_ok
     print(f"{mode:4s} rank {rank:4d} heads {heads:2d} rope {rope:3d}: kernel vs deq-ref {e_k:.2e} | "
-          f"fp8 quant error {e_q:.2e} | gather {e_g:.2e}  {'ok' if ok else 'FAIL'}")
+          f"fp8 quant error {e_q:.2e} | gather {e_g:.2e} (sliced {'=' if sliced_ok else '!='})  {'ok' if ok else 'FAIL'}")
     return ok
 
 

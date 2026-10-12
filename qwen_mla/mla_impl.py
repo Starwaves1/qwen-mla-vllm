@@ -73,7 +73,17 @@ def chunked_workspace_rows(vllm_config) -> int:
     sched, model = vllm_config.scheduler_config, vllm_config.model_config
     if os.environ.get("QWEN_MLA_PREFILL_WS_ROWS"):          # testing: force many unaligned context chunks
         return max(int(os.environ["QWEN_MLA_PREFILL_WS_ROWS"]), sched.max_num_seqs)
-    return max(min(8 * model.max_model_len, 64 * 1024), sched.max_num_seqs)
+    rows = min(8 * model.max_model_len, 64 * 1024)
+    # Scale with the GPU: each row costs ~30 KB of per-chunk scratch at prefill (kv_b output, assembled
+    # key, padded v -- see _profile_prefill_context_scratch), ~1.9 GB at 64k rows on a GLA-g2 rank. That
+    # is noise on a 96 GB part and 12% of a 16 GB one. The row count only splits the same context work
+    # into more chunks: 64k vs 16k rows measured 102.8 s vs 101.6 s for a 67k-token prefill. So: at most
+    # 1024 rows per GiB of device memory -- 15k on a 16 GB card, unchanged (64k) from 64 GB up.
+    import torch
+    if torch.cuda.is_available():
+        gib = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / 2**30
+        rows = min(rows, max(4096, int(gib) * 1024))
+    return max(rows, sched.max_num_seqs)
 
 
 def splitk_cap(batch: int, heads: int, lse_dim: int, splits: int) -> int:
@@ -369,7 +379,9 @@ class QwenMLATritonImpl(TritonMLAImpl):
                         dtype=k_nope.dtype, device=k_nope.device)
         k[..., : k_nope.shape[-1]] = k_nope
         k[..., k_nope.shape[-1]:] = rope.to(k_nope.dtype)
-        return k / rms.unsqueeze(-1).to(k.dtype).clamp(min=1e-6)
+        # In place: an out-of-place divide holds a second full key ([context chunk, heads, 256] -- 0.4 GB
+        # per 64k rows at 12 heads) alongside the first. Same arithmetic, so bit-identical.
+        return k.div_(rms.unsqueeze(-1).to(k.dtype).clamp(min=1e-6))
 
     def _mla_narrow_q(self, q: torch.Tensor) -> torch.Tensor:
         """Narrow q from the packed 280-wide pe to this head's own 64.

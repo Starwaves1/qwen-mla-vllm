@@ -40,6 +40,8 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 `--speculative-config` turns on MTP speculative decoding (optional\*; see [below](#speculative-decoding-mtp)).
 Images work as with the base model (OpenAI `image_url` content). For text-only serving, add
 `--limit-mm-per-prompt '{"image": 0, "video": 0}'` to skip reserving memory for the vision encoder.
+For tool calling (agent harnesses), add `--enable-auto-tool-choice --tool-call-parser qwen3_coder`: the
+chat template emits the base model's `<tool_call><function=...>` XML.
 
 Test request:
 
@@ -83,9 +85,62 @@ default, no MTP): about 106k tokens of KV at 32k max context, measured under an 
 Vision and MTP need more memory than a 24 GB card leaves. The INT4 builds fit a 32 GB card text-only
 (about 250k tokens of KV at 32k context).
 
+## 16 GB GPUs
+
+Two 16 GB GeForce cards (tested: 2x RTX 5060 Ti, PCIe, no NVLink) serve the grouped EXL3 build at the
+**full 262k context with vision and MTP**:
+
+```bash
+vllm serve TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw --tensor-parallel-size 2 --disable-custom-all-reduce \
+  --reasoning-parser qwen3 --max-model-len 262144 --gpu-memory-utilization 0.88 \
+  --max-num-seqs 8 --max-num-batched-tokens 2048 --limit-mm-per-prompt '{"image": 1, "video": 0}' \
+  --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'
+```
+
+* `--max-num-seqs 8 --max-num-batched-tokens 2048` shrink the activation memory vLLM reserves before
+  sizing the KV cache (40% more KV than vLLM's defaults in a text-only test).
+* `--gpu-memory-utilization 0.88` leaves room for a desktop on the GPU that drives the display.
+* Set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the environment (less fragmentation).
+
+Measured (FP8 KV, the default for this build; 8.7 GiB of weights per GPU):
+
+| | KV cache | 262k sequences | decode, short prompt | decode, 9k prompt + 2k-token story | decode at 29k context |
+|---|---|---|---|---|---|
+| no MTP | 463k tokens | 1.77 | 36 tok/s | 36 tok/s | 34 tok/s |
+| MTP, k=3 | 305k tokens | 1.16 | 68-75 tok/s | 56-58 tok/s | 48 tok/s |
+
+A 251k-token prompt with an image attached ran to completion (needle and image both answered correctly),
+peaking at 14.8 / 14.1 GB per GPU. Prefill is about 750 tokens/s and slows with context (251k tokens took
+9 minutes); vLLM has no prefix caching for this hybrid architecture, so an agent loop pays it on every turn.
+
+Home-hardware notes:
+
+* **Tool calling** for agent harnesses: `--enable-auto-tool-choice --tool-call-parser qwen3_coder`.
+* **Streaming with MTP** delivers one chunk per decode step, carrying all tokens accepted in it (about 2-3).
+  A client that counts chunks as tokens reports the step rate, roughly half the real speed.
+* **No system CUDA toolkit, or one older than 12.8?** Both the cuda-exl3 build and FlashInfer's JIT need
+  an `nvcc` that knows your GPU (sm_120 for RTX 50-series). A user-space toolkit from pip works, matching
+  the CUDA version torch was built for (`python -c "import torch; print(torch.version.cuda)"`, 13.0 for
+  vLLM 0.27.1):
+
+  ```bash
+  pip install "nvidia-cuda-nvcc==13.0.*" "nvidia-nvvm==13.0.*" "nvidia-cuda-crt==13.0.*" "nvidia-cuda-runtime==13.0.*"
+  export CUDA_HOME=$(python -c "import nvidia, os; print(os.path.join(nvidia.__path__[0], 'cu13'))")
+  export PATH=$CUDA_HOME/bin:$PATH
+  ln -sf libcudart.so.13 $CUDA_HOME/lib/libcudart.so; ln -sfn lib $CUDA_HOME/lib64
+  TORCH_CUDA_ARCH_LIST=12.0 pip install --no-build-isolation "git+https://github.com/Zeuss5/cuda-exl3"
+  ```
+
+  Keep `CUDA_HOME` and `PATH` set when serving. All four packages must be the same minor version (a newer
+  `nvidia-nvvm` produces PTX the older `ptxas` rejects: `Unsupported .version`).
+* **`Xid 79, GPU has fallen off the bus`** under sustained MTP load (seen at the 180 W stock limit on an
+  RTX 5060 Ti in a PCIe 5.0 slot) is a power or link-integrity event, not a software fault. Capping power
+  (`sudo nvidia-smi -pl 150`, reapplied at boot) stopped it; decode speed was unaffected. Forcing the slot to
+  PCIe 4.0 in the BIOS is the other usual fix.
+
 ## Requirements
 
-* **NVIDIA GPU** with vLLM 0.27.1 support. This version is tested on RTX PRO 6000
+* **NVIDIA GPU** with vLLM 0.27.1 support. Tested on RTX PRO 6000 and RTX 5060 Ti
   (Blackwell, sm_120); earlier versions ran on H100 (sm_90).
 * **vLLM 0.27.1** exactly (installed as a dependency). The plugin hooks vLLM internals that change
   between releases.
@@ -152,11 +207,13 @@ The speedup is smaller than the base model's because a verify step currently rea
 per draft token; a single causal pass per request is planned. Greedy output with MTP differs from greedy
 output without it no more than it does for the base model.
 
-\*Measured on one GPU type (RTX PRO 6000, very high memory bandwidth); the table above uses a bf16 KV cache.
-With the FP8 KV cache, k=3 gave 1.6x (bf16 build) and 1.3x (FP8 build) at one concurrent request, but did
-not speed up the INT4 or EXL3 builds there (their weights are already cheap to read; each verify step has a
-fixed cost on the FP8-cache path). Where weight reads dominate decode, on lower-bandwidth GPUs, MTP is
-likely to help more. Measure it on your hardware.
+\*The table was measured on one GPU type (RTX PRO 6000, very high memory bandwidth) with a bf16 KV cache.
+With the FP8 KV cache there, k=3 gave 1.6x (bf16 build) and 1.3x (FP8 build) at one concurrent request
+and did not speed up the INT4 or EXL3 builds. Those FP8-cache numbers predate 0.6.0: an FP8 cache sent
+the draft's attention layer to FlashInfer, which made vLLM drop the whole engine to piecewise CUDA graphs
+with spec decode. 0.6.0 keeps full graphs (the draft layer runs on Triton), and on 2x RTX 5060 Ti the
+GLA-g2-EXL3 build now gains 1.6-2.1x from k=3 (see [16 GB GPUs](#16-gb-gpus)). The RTX PRO 6000 FP8-cache
+numbers have not been re-measured; measure on your hardware.
 
 ### Vision
 
@@ -183,6 +240,8 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_FP8_RMS` | `log8` | FP8 cache: format of the per-head score divisor (`log8`, `bf16` = wider rows and no MTP, `e4m3`) |
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
+| `QWEN_MLA_PREFILL_WS_ROWS` | 1024 per GiB of GPU memory, max 64k | context rows per long-prompt prefill chunk; scratch is ~30 KB per row |
+| `QWEN_MLA_MTP_DRAFT_BACKEND` | Triton with an FP8 cache (not Hopper) | attention backend of the MTP draft layer; `auto` leaves it to vLLM (see [MTP](#speculative-decoding-mtp)) |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
 | `QWEN_MLA_FI_DEBUG` | unset | `1` logs which decode kernel each layer uses, and why |
 
@@ -200,6 +259,11 @@ MLA decode: flashinfer MLA kernel active (overlay ...)
 
 If it says `flashinfer path unavailable (...); using the Triton kernel`, the reason in parentheses
 says why (usually a missing `nvcc`). Generation still works.
+
+With MTP and an FP8 cache, also expect `[qwen-mla] MTP draft attention -> TRITON_ATTN`, and
+`Capturing CUDA graphs (decode, FULL)`. If instead the log says `setting cudagraph_mode=PIECEWISE`,
+decode runs well below its speed (an explicit `attention_backend` in `--speculative-config` overrides
+the plugin's choice).
 
 Kernel correctness tests (need a GPU):
 

@@ -8,7 +8,13 @@ Instructions for coding agents setting this up on a user's machine. Follow them 
 nvidia-smi                      # an NVIDIA GPU and driver must be present
 python3 --version               # 3.12 expected
 nvcc --version || echo "no nvcc: the server will work, using the slower Triton decode path"
+nvidia-smi --query-gpu=name,compute_cap,memory.total,power.limit --format=csv
 ```
+
+RTX 50-series GPUs (compute capability 12.0) need `nvcc` from CUDA 12.8 or newer. If the system
+toolkit is missing or older and you cannot install one system-wide, install a user-space toolkit from
+pip as shown in the README ("No system CUDA toolkit" under "16 GB GPUs"). It is required for EXL3 builds
+and for the fast decode path, and `CUDA_HOME`/`PATH` must stay set when serving.
 
 Use a fresh virtual environment. This package pins `vllm==0.27.1`; do not install it into an
 environment that needs a different vLLM version.
@@ -35,9 +41,10 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 ```
 
 * Optional: `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` (MTP speculative decoding).
-  On an RTX PRO 6000 it sped up the bf16 and FP8 builds (1.3-1.7x at low concurrency) but not the INT4 or
-  EXL3 builds. The benefit depends on the GPU (likely larger on lower-bandwidth cards), so leave it off
-  unless the user asks, or measure first.
+  Measured 1.6-2.1x decode on 2x RTX 5060 Ti (GLA-g2-EXL3) and 1.3-1.7x for bf16/FP8 builds on an
+  RTX PRO 6000. It costs KV capacity (the draft has its own cache). Recommend it for single-user,
+  latency-bound serving; measure first for high-concurrency serving.
+* Tool calling (agent harnesses): `--enable-auto-tool-choice --tool-call-parser qwen3_coder`.
 * The models accept images like the base model. If the user only needs text, add
   `--limit-mm-per-prompt '{"image": 0, "video": 0}'`.
 * Pick the weight format by VRAM per GPU (MLA for 1 GPU, GLA-g2 for 2):
@@ -48,6 +55,10 @@ vllm serve TelperionAI/Qwen3.8-27B-GLA-g2 --tensor-parallel-size 2 --reasoning-p
 * **EXL3 builds need a second plugin**, cuda-exl3 (https://github.com/Zeuss5/cuda-exl3). Install it after
   this one: `pip install --no-build-isolation "git+https://github.com/Zeuss5/cuda-exl3"` (compiles CUDA
   code; needs `nvcc`; takes a few minutes).
+* **Two 16 GB GPUs** (e.g. RTX 5060 Ti): `TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw` at TP=2 serves the full
+  262k context with vision and MTP using the exact command in the README section "16 GB GPUs"
+  (`--max-num-seqs 8 --max-num-batched-tokens 2048 --gpu-memory-utilization 0.88`). Do not add
+  `--kv-cache-memory-bytes`; the plugin sizes the cache correctly.
 * **24 GB GPU:** use `TelperionAI/Qwen3.8-27B-MLA-EXL3-4.0bpw` text-only:
   `--limit-mm-per-prompt '{"image": 0, "video": 0}' --max-model-len 32768`, no `--speculative-config`.
   **32 GB:** `-MLA-INT4` with the same flags.
@@ -80,4 +91,9 @@ The answer should contain `391`. In the server log, check for:
 | hang or `custom_all_reduce ... invalid argument` at TP>1 | add `--disable-custom-all-reduce` |
 | `flashinfer path unavailable (... nvcc ...)` | install the CUDA toolkit (matching the driver) and `ninja`, then restart; or accept the Triton path |
 | `the shipped kernel headers target flashinfer X, installed is Y` | a different flashinfer was installed; reinstall in a fresh venv |
-| out of memory at startup | lower `--max-model-len` or `--gpu-memory-utilization` |
+| out of memory at startup | lower `--max-model-len` or `--gpu-memory-utilization`; on 16-24 GB GPUs add `--max-num-seqs 8 --max-num-batched-tokens 2048` |
+| `To serve at least one request with the model's max seq len ... KV cache is needed` | the KV cache cannot hold one `--max-model-len` sequence; lower it, drop MTP, or set `--limit-mm-per-prompt '{"image": 0, "video": 0}'` |
+| `FlashInfer requires GPUs with sm75 or higher` on an RTX 50-series GPU | misleading: FlashInfer's JIT found an `nvcc` too old for sm_120. Put CUDA >= 12.8 first on `PATH` and set `CUDA_HOME` |
+| `ptxas ... Unsupported .version` while building cuda-exl3 | mixed CUDA versions in the pip toolkit (`nvidia-nvvm` newer than `nvidia-cuda-nvcc`); pin all to the same minor version |
+| `Xid 79, GPU has fallen off the bus` in `journalctl -k`, server dies mid-generation | hardware: power or PCIe link. Ask the user to cap power (`sudo nvidia-smi -pl 150` on an RTX 5060 Ti) or force the slot to PCIe 4.0; do not retry heavy load until they have |
+| tok/s reported by a client is about half the server log's `Avg generation throughput` with MTP | the client counts stream chunks, and MTP sends several tokens per chunk; trust the server log |
