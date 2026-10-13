@@ -113,7 +113,13 @@ Measured (FP8 KV, the default for this build; 8.7 GiB of weights per GPU; decode
 | | KV cache | 262k sequences | decode, short prompt | decode, 9k prompt + 2k-token story | decode at 29k context |
 |---|---|---|---|---|---|
 | no MTP | 463k tokens (432k with prefix caching) | 1.77 | 36 tok/s | 36 tok/s | 34 tok/s |
-| MTP, k=3 | 305k tokens (283k with prefix caching) | 1.16 | 68-75 tok/s | 56-58 tok/s | 48 tok/s |
+| MTP, k=3 | 305k tokens (283k with prefix caching) | 1.16 | 68-75 tok/s | 56-58 tok/s | 62-64 tok/s (with prefix caching) |
+
+With MTP and prefix caching, decode at 81k context runs at 55 tok/s greedy (50-54 with the default
+sampling). Before 0.6.3 a verify step read the latent cache once per draft token and it was 44; reading it
+once per request costs about 1-3% at short context, inside run-to-run noise. For comparison, cyankiwi's
+AWQ-INT4 quant of the base model on the same cards and vLLM, with MTP k=3 and prefix caching, decodes at
+57 / 63 / 56 tok/s at 1k / 29k / 81k context, but fits only 100k tokens of context, text-only.
 
 A 251k-token prompt with an image attached ran to completion (needle and image both answered correctly),
 peaking at 14.8 / 14.1 GB per GPU. Prefill is about 750 tokens/s and slows with context (251k tokens took
@@ -216,9 +222,12 @@ bf16):
 | Qwen3.8-27B, TP=2 | 45 / 240 / 850 | 91 / 431 / 1,393 | 2.03× / 1.79× / 1.64× |
 | **Qwen3.8-27B-GLA-g2, TP=2** | 42 / 217 / 846 | 70 / 341 / 1,180 | 1.65× / 1.57× / 1.39× |
 
-The speedup is smaller than the base model's because a verify step currently reads the latent cache once
-per draft token; a single causal pass per request is planned. Greedy output with MTP differs from greedy
-output without it no more than it does for the base model.
+The speedup in this table is smaller than the base model's because a verify step read the latent cache once
+per draft token. Since 0.6.3 the Triton decode kernels, used with an FP8 cache, read it once per request
+(at TP=1, once per two draft tokens), which keeps MTP decode from falling off at long context; see
+[16 GB GPUs](#16-gb-gpus). The FlashInfer decode path, used with a bf16 cache, still reads it once per
+draft token. Greedy output with MTP differs from greedy output without it no more than it does for the
+base model.
 
 \*The table was measured on one GPU type (RTX PRO 6000, very high memory bandwidth) with a bf16 KV cache.
 With the FP8 KV cache there, k=3 gave 1.6x (bf16 build) and 1.3x (FP8 build) at one concurrent request
@@ -253,8 +262,10 @@ Nothing is required. Optional environment variables:
 | variable | default | effect |
 |---|---|---|
 | `QWEN_MLA_DECODE_BACKEND` | `flashinfer` | `triton` disables the FlashInfer fast path |
-| `QWEN_MLA_TWO_PASS` | `1` | `0` disables the two-pass kernel for the 1792 latent |
-| `QWEN_MLA_2P_SCRATCH_MB` | `256` | scratch budget of the two-pass kernel; very long contexts process keys in rounds when exceeded |
+| `QWEN_MLA_TWO_PASS` | `1` | `0` disables the two-pass kernel for the 1792 latent (spec-verify steps use it regardless) |
+| `QWEN_MLA_2P_SCRATCH_MB` | `256` (`64` for spec-verify steps) | scratch budget of the two-pass kernel; very long contexts process keys in rounds when exceeded |
+| `QWEN_MLA_GROUPED_VERIFY` | `1` | Triton decode with MTP: `0` gives each draft token its own kernel row, re-reading the latent cache per token. Grouping was measured on 99 KB-shared-memory cards (RTX 50-series); on others, compare both |
+| `QWEN_MLA_VERIFY_MAX_ROWS` | `64` | most query rows (draft tokens x local heads) one grouped program serves; above it a request's tokens split into smaller groups |
 | `QWEN_MLA_FP8_RMS` | `log8` | FP8 cache: format of the per-head score divisor (`log8`, `bf16` = wider rows and no MTP, `e4m3`) |
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |

@@ -301,6 +301,7 @@ class QwenMLATritonImpl(TritonMLAImpl):
 
     def _mla_kernel(self, *args, **kwargs):
         kwargs["rms_offset"] = self.rms_offset
+        kwargs["qrows"] = getattr(self, "_mla_qrows", 1)
         kwargs["rms_bf16"] = self.mla_kv_fp8 and mla_fp8_rms_bf16()
         kwargs["rms_log8"] = self.mla_kv_fp8 and mla_fp8_rms_mode() == "log8"
         return mla_decode_attention_fwd(*args, **kwargs)
@@ -451,6 +452,11 @@ class QwenMLATritonImpl(TritonMLAImpl):
         q0 = q[0] if isinstance(q, tuple) else q
         B, H, lse_dim = q0.shape[0], q0.shape[1], self.kv_lora_rank + 1
         orig, orig_splits = _t.decode_attention_fwd, _t._compute_num_kv_splits
+        # Spec-verify steps: _build_decode flattened each request's q tokens into q rows; the kernel
+        # folds them back so the cache is read once per request (see decode_attention_fwd).
+        # QWEN_MLA_GROUPED_VERIFY=0 restores one kernel row per token (measured only on 99 KB-smem cards).
+        grouped = attn_metadata.causal and os.environ.get("QWEN_MLA_GROUPED_VERIFY", "1") != "0"
+        self._mla_qrows = getattr(attn_metadata.decode, "_mla_q", 1) if grouped else 1
         _t.decode_attention_fwd = self._mla_kernel
         _t._compute_num_kv_splits = lambda msl, sm: splitk_cap(B, H, lse_dim, orig_splits(msl, sm))
         try:

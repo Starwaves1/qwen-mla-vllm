@@ -104,5 +104,6 @@ The answer should contain `391`. In the server log, check for:
 | `Xid 79, GPU has fallen off the bus` in `journalctl -k`, server dies mid-generation | hardware: power or PCIe link. Ask the user to cap power (`sudo nvidia-smi -pl 150` on an RTX 5060 Ti) or force the slot to PCIe 4.0; do not retry heavy load until they have |
 | `AssertionError` in `_apply_cow` (engine dies on a prefix-cache hit) | plugin older than 0.6.1; upgrade |
 | with MTP, an occasional prompt answers with garbage from the first token (`!!!!`, stray words) | plugin older than 0.6.1 (a final prefill chunk of exactly 1 + k tokens replayed the decode graph); upgrade |
+| MTP decode falls off sharply at long context (2x RTX 5060 Ti, k=3: 64 tok/s at 1k, 44 at 81k) | plugin older than 0.6.3 with an FP8 cache: every draft token re-read the latent cache. Upgrade; 0.6.3 gives 55 at 81k |
 | prefix caching on but `Prefix cache hit rate` stays low across turns of one conversation | the harness changes earlier messages (timestamps, reordering) so the prefix differs; nothing to fix server-side |
 | tok/s reported by a client is about half the server log's `Avg generation throughput` with MTP | the client counts stream chunks, and MTP sends several tokens per chunk; trust the server log |

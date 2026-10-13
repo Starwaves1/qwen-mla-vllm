@@ -607,13 +607,15 @@ def _mla2p_scores_kernel(
     H: tl.constexpr, Lv: tl.constexpr, Lk: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr,
     DC: tl.constexpr, BLOCK_DPE: tl.constexpr, NUM_KV_SPLITS: tl.constexpr, PAGE_SIZE: tl.constexpr,
     RMS_OFFSET: tl.constexpr, logit_cap: tl.constexpr, CHUNK: tl.constexpr, RMS_BF16: tl.constexpr,
-    RMS_LOG8: tl.constexpr,
+    RMS_LOG8: tl.constexpr, QROWS: tl.constexpr = 1, HPR: tl.constexpr = 1,
 ):
     ks = tl.load(k_scale)
     b = tl.program_id(0)
     split = tl.program_id(1)
     heads = tl.arange(0, BLOCK_H)
     mh = heads < H
+    # rms scalars are stored per real head; verify rows (QROWS > 1) repeat the head set per row
+    rh = heads % HPR if QROWS > 1 else heads
     seq = tl.load(B_Seqlen + b)
     per = tl.cdiv(tl.cdiv(seq, NUM_KV_SPLITS), BLOCK_N) * BLOCK_N     # same bounds as stage 1/2
     split_start = per * split
@@ -649,15 +651,15 @@ def _mla2p_scores_kernel(
         if RMS_OFFSET >= 0:
             if RMS_LOG8:
                 rms_row = (K_Buffer + kv_off + RMS_OFFSET).to(tl.pointer_type(tl.uint8))
-                code = tl.load(rms_row[None, :] + heads[:, None],
+                code = tl.load(rms_row[None, :] + rh[:, None],
                                mask=mh[:, None] & mn[None, :], other=128).to(tl.float32)
                 rms = tl.exp2(-3.0 + code * (6.0 / 255.0))
             elif RMS_BF16:
                 rms_row = (K_Buffer + kv_off + RMS_OFFSET).to(tl.pointer_type(tl.bfloat16))
-                rms = tl.load(rms_row[None, :] + heads[:, None],
+                rms = tl.load(rms_row[None, :] + rh[:, None],
                               mask=mh[:, None] & mn[None, :], other=1.0).to(tl.float32)
             else:
-                rms_raw = tl.load(K_Buffer + kv_off[None, :] + (RMS_OFFSET + heads)[:, None],
+                rms_raw = tl.load(K_Buffer + kv_off[None, :] + (RMS_OFFSET + rh)[:, None],
                                   mask=mh[:, None] & mn[None, :], other=1.0)
                 if rms_raw.dtype.is_fp8():
                     rms = rms_raw.to(tl.float32) * ks
@@ -667,6 +669,11 @@ def _mla2p_scores_kernel(
         qk *= sm_scale
         if logit_cap > 0:
             qk = logit_cap * tanh(qk / logit_cap)
+        if QROWS > 1:
+            # Verify rows: query row j (heads j*HPR ..) is draft position j of q, so it sees all but
+            # the last QROWS-1-j keys of the request -- causal over the draft tokens.
+            lim = seq - (QROWS - 1 - heads // HPR)
+            qk = tl.where(offs_n[None, :] < lim[:, None], qk, float("-inf"))
         tl.store(S + b * stride_sb + heads[:, None] * stride_sh + split * stride_ss + (offs_n - start)[None, :],
                  qk, mask=mh[:, None] & mn[None, :])
 
@@ -678,11 +685,13 @@ def _mla2p_pv_kernel(
     stride_lb, stride_lh, chunk_start, k_scale,
     H: tl.constexpr, Lv: tl.constexpr, BLOCK_H: tl.constexpr, BLOCK_N: tl.constexpr, DVC: tl.constexpr,
     NUM_KV_SPLITS: tl.constexpr, PAGE_SIZE: tl.constexpr, CHUNK: tl.constexpr, MERGE: tl.constexpr,
-    LSE_TO_OUT: tl.constexpr,
+    LSE_TO_OUT: tl.constexpr, QROWS: tl.constexpr = 1,
 ):
-    b = tl.program_id(0)
-    split = tl.program_id(1)
-    dvc = tl.program_id(2)
+    # Output slice is the FASTEST grid axis: the slices of one (request, split) run together and share
+    # its score tile through L2 instead of each re-reading it from DRAM (Lv / DVC reads otherwise).
+    dvc = tl.program_id(0)
+    b = tl.program_id(1)
+    split = tl.program_id(2)
     heads = tl.arange(0, BLOCK_H)
     mh = heads < H
     offs_dv = dvc * DVC + tl.arange(0, DVC)
@@ -714,21 +723,38 @@ def _mla2p_pv_kernel(
             if v.dtype.is_fp8():
                 v = (v.to(tl.float32) * tl.load(k_scale)).to(tl.bfloat16)
             n_max = tl.maximum(tl.max(sc, 1), e_max)
-            re = tl.exp(e_max - n_max)
-            pr = tl.exp(sc - n_max[:, None])
+            if QROWS > 1:
+                # A verify row can have every key of a tile masked (-inf): shift by 0 instead of -inf
+                # so exp() gives 0, not NaN.
+                n_ref = tl.where(n_max == float("-inf"), 0.0, n_max)
+                re = tl.exp(e_max - n_ref)
+                pr = tl.exp(sc - n_ref[:, None])
+            else:
+                re = tl.exp(e_max - n_max)
+                pr = tl.exp(sc - n_max[:, None])
             acc = acc * re[:, None] + tl.dot(pr.to(v.dtype), v)
             e_sum = e_sum * re + tl.sum(pr, 1)
             e_max = n_max
         base = b * stride_ob + heads * stride_oh + split * stride_os
-        o = acc / e_sum[:, None]
+        if QROWS > 1:
+            # A row with no visible key in this split leaves o = 0, lse = -inf: stage 2 then gives it
+            # zero weight (an earlier split always has keys), where 0/0 would poison the merge.
+            o = acc / tl.where(e_sum > 0, e_sum, 1.0)[:, None]
+        else:
+            o = acc / e_sum[:, None]
         lse = e_max + tl.log(e_sum)
         if MERGE:                     # fold this chunk into the partial from earlier rounds
             lse_p = tl.load(Lse_In + lse_off, mask=mh, other=float("-inf"))
             o_p = tl.load(Att_Out + base[:, None] + offs_dv[None, :], mask=mh[:, None] & mdv[None, :], other=0.0)
             m = tl.maximum(lse_p, lse)
+            if QROWS > 1:
+                m = tl.where(m == float("-inf"), 0.0, m)
             wp = tl.exp(lse_p - m)
             wc = tl.exp(lse - m)
-            o = (o_p * wp[:, None] + o * wc[:, None]) / (wp + wc)[:, None]
+            if QROWS > 1:
+                o = (o_p * wp[:, None] + o * wc[:, None]) / tl.where(wp + wc > 0, wp + wc, 1.0)[:, None]
+            else:
+                o = (o_p * wp[:, None] + o * wc[:, None]) / (wp + wc)[:, None]
             lse = m + tl.log(wp + wc)
         tl.store(Att_Out + base[:, None] + offs_dv[None, :], o, mask=mh[:, None] & mdv[None, :])
         if dvc == 0:
@@ -751,7 +777,7 @@ def _small_smem(device) -> bool:
 
 def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_splits, sm_scale,
                          page_size, rms_offset, logit_cap, Lk, Lv, k_scale=None, rms_bf16=False,
-                         rms_log8=False):
+                         rms_log8=False, qrows=1):
     """Wide-latent MLA decode as scores pass + P.V pass (see the comment above the kernels).
 
     Scores are fp32 (bf16 would distort exp() at |logit| ~ 30) in a scratch of [batch, heads, splits,
@@ -760,6 +786,9 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
     folds its partial into the running one with the standard LSE merge (LSEs ping-pong between two small
     buffers so no program reads an LSE another is overwriting). The round count comes from the block
     table's shape, not from sequence lengths, so it is fixed per CUDA-graph capture.
+
+    qrows > 1: q holds each request's spec-verify tokens as extra heads, [requests, qrows * heads, Lk],
+    with b_seq_len the length including the last draft token (see decode_attention_fwd).
     """
     import os as _o
     B, H = q.shape[0], q.shape[1]
@@ -768,8 +797,11 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
     BLOCK_H = max(16, triton.next_power_of_2(H))
     # Defaults measured at batch 38 / ctx 16.6k / 24 heads / 32 splits on RTX PRO 6000: 3.92 ms/layer vs
     # 7.63 single-pass (DC 128/DVC 256: 4.26; DC 64/DVC 128: 4.51; warps/stages: flat).
-    DC = int(_o.environ.get("QWEN_MLA_2P_DC", 256))          # latent chunk of the scores pass
-    DVC = int(_o.environ.get("QWEN_MLA_2P_DVC", 512))        # output slice per P.V program
+    # A 64-row block (4 verify tokens x 12 heads) spills the [64, 512] fp32 accumulator; 128/128 measured
+    # best there (RTX 5060 Ti, 81k context: 627 vs 742 us at rank 384, 1210 vs 1378 at 896).
+    wide = BLOCK_H >= 64
+    DC = int(_o.environ.get("QWEN_MLA_2P_DC", 128 if wide else 256))     # latent chunk of the scores pass
+    DVC = int(_o.environ.get("QWEN_MLA_2P_DVC", 128 if wide else 512))   # output slice per P.V program
     WA = int(_o.environ.get("QWEN_MLA_2P_WARPS_A", 4)); WB = int(_o.environ.get("QWEN_MLA_2P_WARPS_B", 4))
     SA = int(_o.environ.get("QWEN_MLA_2P_STAGES_A", 2)); SB = int(_o.environ.get("QWEN_MLA_2P_STAGES_B", 2))
     BLOCK_DPE = triton.next_power_of_2(Lk - Lv) if Lk > Lv else 0
@@ -777,7 +809,10 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
     max_tokens = req_to_token.shape[1] * page_size                       # static per capture
     cdiv = lambda a, b: -(-a // b)
     per_max = cdiv(cdiv(max_tokens, num_kv_splits), BLOCK_N) * BLOCK_N   # longest possible split
-    budget = int(float(_o.environ.get("QWEN_MLA_2P_SCRATCH_MB", 256)) * (1 << 20))
+    # Verify rows put qrows x the heads in the score scratch, and it is allocated inside the captured
+    # decode graph: 64 MB keeps one round for a single request at 262k on 16 GB cards, where the 256 MB
+    # default would hold 256 MB of graph pool at batch 8.
+    budget = int(float(_o.environ.get("QWEN_MLA_2P_SCRATCH_MB", 64 if qrows > 1 else 256)) * (1 << 20))
     fit = budget // (4 * B * H * num_kv_splits)
     CHUNK = per_max if fit >= per_max else max(BLOCK_N, (fit // BLOCK_N) * BLOCK_N)
     rounds = -(-per_max // CHUNK)
@@ -798,15 +833,16 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
             cs, k_scale,
             H=H, Lv=Lv, Lk=Lk, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, DC=DC, BLOCK_DPE=BLOCK_DPE,
             NUM_KV_SPLITS=num_kv_splits, PAGE_SIZE=page_size, RMS_OFFSET=rms_offset, logit_cap=logit_cap,
-            CHUNK=CHUNK, RMS_BF16=rms_bf16, RMS_LOG8=rms_log8, num_warps=WA, num_stages=SA)
+            CHUNK=CHUNK, RMS_BF16=rms_bf16, RMS_LOG8=rms_log8, QROWS=qrows, HPR=H // qrows,
+            num_warps=WA, num_stages=SA)
         lin, lout = lse_bufs[r % 2], lse_bufs[(r + 1) % 2]
-        _mla2p_pv_kernel[(B, num_kv_splits, triton.cdiv(Lv, DVC))](
+        _mla2p_pv_kernel[(triton.cdiv(Lv, DVC), B, num_kv_splits)](
             S, k_buffer, att_out, req_to_token, b_seq_len, lin, lout,
             req_to_token.stride(0), kp, kt, S.stride(0), S.stride(1), S.stride(2),
             att_out.stride(0), att_out.stride(1), att_out.stride(2),
             lin.stride(0) if rounds > 1 else 0, lin.stride(1) if rounds > 1 else 0, cs, k_scale,
             H=H, Lv=Lv, BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, DVC=DVC, NUM_KV_SPLITS=num_kv_splits,
-            PAGE_SIZE=page_size, CHUNK=CHUNK, MERGE=r > 0, LSE_TO_OUT=rounds == 1,
+            PAGE_SIZE=page_size, CHUNK=CHUNK, MERGE=r > 0, LSE_TO_OUT=rounds == 1, QROWS=qrows,
             num_warps=WB, num_stages=SB)
     if rounds > 1:
         att_out[..., Lv].copy_(lse_bufs[rounds % 2])                     # final LSE into vLLM's format
@@ -833,6 +869,7 @@ def _decode_grouped_att_m_fwd(
     rms_offset=-1,
     rms_bf16=False,
     rms_log8=False,
+    qrows=1,
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
@@ -846,11 +883,13 @@ def _decode_grouped_att_m_fwd(
     # BLOCK_H 4, which re-reads the latent once per 4 heads; use the two-pass kernels instead.
     # Large-smem devices (H100) keep the single-pass path. QWEN_MLA_TWO_PASS=0 disables it.
     import os as _os2
-    if (is_mla and not is_hip_ and Lv >= 1536 and _small_smem(q.device)
-            and _os2.environ.get("QWEN_MLA_TWO_PASS", "1") != "0" and page_size % 16 == 0):
+    # Spec-verify rows (qrows > 1) always take it: its programs cover the whole head set, which is
+    # what lets every query token of a request share one read of the cache.
+    if qrows > 1 or (is_mla and not is_hip_ and Lv >= 1536 and _small_smem(q.device)
+                     and _os2.environ.get("QWEN_MLA_TWO_PASS", "1") != "0" and page_size % 16 == 0):
         return _decode_mla_two_pass(q, k_buffer, att_out, Req_to_tokens, B_Seqlen, num_kv_splits,
                                     sm_scale, page_size, rms_offset, logit_cap, Lk, Lv,
-                                    k_scale=k_scale, rms_bf16=rms_bf16, rms_log8=rms_log8)
+                                    k_scale=k_scale, rms_bf16=rms_bf16, rms_log8=rms_log8, qrows=qrows)
 
     # Align tile dimensions with latent rank for MLA to avoid shape mismatch.
     if is_mla:
@@ -1196,6 +1235,7 @@ def decode_attention_fwd_grouped(
     rms_offset=-1,
     rms_bf16=False,
     rms_log8=False,
+    qrows=1,
 ):
     align_n = _decode_grouped_att_m_fwd(
         q,
@@ -1214,6 +1254,7 @@ def decode_attention_fwd_grouped(
         rms_offset=rms_offset,
         rms_bf16=rms_bf16,
         rms_log8=rms_log8,
+        qrows=qrows,
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits, align_n=align_n
@@ -1239,8 +1280,34 @@ def decode_attention_fwd(
     rms_offset=-1,
     rms_bf16=False,
     rms_log8=False,
+    qrows=1,
 ):
+    """qrows > 1: rows come in groups of qrows consecutive spec-verify tokens of one request, as
+    _build_decode flattens them (same block table, lengths L-qrows+1 .. L). The MLA path folds each
+    group into one row of qrows * heads queries so the latent cache is read once per request rather
+    than once per token: at 81k context the 4 rows of an MTP k=3 verify step took 3.8x the time of
+    one token on the single-pass kernel, nearly all of it re-reading the same cache."""
     assert num_kv_splits == attn_logits.shape[2]
+    if qrows > 1:
+        # At most 64 query rows per group: a 128-row block (4 tokens x 24 heads at TP=1) spends more on
+        # its score scratch than it saves on cache reads, so there a request splits into groups of 2
+        # tokens (RTX 5060 Ti, 81k, rank 1792: 4.99 ms as one group of 4, 4.45 flattened, 4.17 as 2 x 2).
+        import os as _o3
+        cap = int(_o3.environ.get("QWEN_MLA_VERIFY_MAX_ROWS", 64))
+        # A group must divide the request's tokens: one straddling two requests would mix their caches.
+        g = max([d for d in range(1, qrows + 1) if qrows % d == 0 and d * q.shape[1] <= cap] or [1])
+        ok = q.shape[0] % qrows == 0
+        qrows = g
+        if not (ok and qrows > 1 and is_mla and page_size % 16 == 0 and not is_hip_):
+            qrows = 1
+        else:
+            n, H = q.shape[0] // qrows, q.shape[1]
+            q = q.reshape(n, qrows * H, q.shape[2])
+            o = o.view(n, qrows * H, o.shape[2])
+            lse = lse.view(n, qrows * H)
+            attn_logits = attn_logits.view(n, qrows * H, *attn_logits.shape[2:])
+            req_to_token = req_to_token[qrows - 1::qrows]         # strided view; kernels take the stride
+            b_seq_len = b_seq_len[qrows - 1::qrows].contiguous()  # the last row's length is the request's
 
     if k_scale is None:
         k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
@@ -1288,4 +1355,5 @@ def decode_attention_fwd(
             rms_offset=rms_offset,
             rms_bf16=rms_bf16,
             rms_log8=rms_log8,
+            qrows=qrows,
         )
