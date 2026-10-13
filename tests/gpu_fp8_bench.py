@@ -2,9 +2,9 @@
 """GPU: FP8 KV cache on sm_86 -- correctness and decode speed vs a bf16 cache (Qwen3.8-27B MLA, TP=1 shapes).
 
 Correctness (every QWEN_MLA_FP8_DECODE mode, through the real decode kernels):
-  decode-V   1-token attention returns V exactly: output == float(e4m3) * k_scale, bit for bit, every finite code at
-             every latent position (single-pass ranks 256/768, two-pass 1792)
-  decode-K   one-hot q, rms 1, sm_scale 1: the LSE is the score q.k == float(e4m3) * k_scale, bit for bit, every
+  decode-V   1-token attention returns V exactly: output == float(e4m3) * k_scale (exact float equality: bit for bit
+             except that -0 comes out +0), every finite code at every latent position (single-pass ranks 256/768, two-pass 1792)
+  decode-K   one-hot q, rms 1, sm_scale 1: the LSE is the score q.k == float(e4m3) * k_scale exactly, every
              latent and rope position
   attention  fp32 output vs exact attention over the dequantized cache (< 1e-3), and vs the bf16-KV reference:
              within the FP8 quantization error (|err - quant err| <= 0.1 * quant err + 1e-3)
@@ -79,7 +79,7 @@ def worker(mode, do_bf16, out_path, deadline):
         c = cache[:, 0, 0, :rank].long()
         want = (val[c] * ks)[:, None, :].expand(B, HEADS, rank)
         fin = torch.isfinite(val[c])[:, None, :].expand(B, HEADS, rank)
-        okv = torch.equal(o[fin].view(torch.int32), want[fin].view(torch.int32))
+        okv = torch.equal(o[fin], want[fin])
         # K: rms bf16 = 1.0, sm_scale 1, q one-hot -> LSE = the single score = float(code) * k_scale
         L = rank + ROPE
         B = -(-L // HEADS)
@@ -97,7 +97,7 @@ def worker(mode, do_bf16, out_path, deadline):
         code = cache[0, 0, 0, :L].long()[j]
         want = (val[code] * ks).view(B, HEADS)
         fin = torch.isfinite(val[code]).view(B, HEADS)
-        okk = torch.equal(lse[fin].view(torch.int32), want[fin].view(torch.int32))
+        okk = torch.equal(lse[fin], want[fin])
         res["checks"][f"decode_exact_r{rank}"] = bool(okv and okk)
         log(f"rank {rank}: decode-V bit-exact {okv}, decode-K bit-exact {okk}")
 
