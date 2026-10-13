@@ -802,7 +802,7 @@ def _mla2p_pv_kernel(
             n_max = tl.maximum(tl.max(sc, 1), e_max)
             re = tl.exp(e_max - n_max)
             pr = tl.exp(sc - n_max[:, None])
-            if v.dtype.is_fp16():                   # uint8 cache: v at 1/256; 2^14 keeps small p normal
+            if K_Buffer.dtype.element_ty == tl.uint8:   # v at 1/256 (_e4m3_f16); 2^14 keeps small p normal
                 acc = acc * re[:, None] + tl.dot((pr * 16384.0).to(tl.float16), v)
             else:
                 acc = acc * re[:, None] + tl.dot(pr.to(v.dtype), v)
