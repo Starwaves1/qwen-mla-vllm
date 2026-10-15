@@ -42,7 +42,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from .partial_rope import patch_partial_rope, rope_keep_from_config
 
 from .mla_impl import (QwenMLATritonBackend, chunked_workspace_rows, mla_fp8_rms_bf16, mla_gla_split, mla_kv_fp8,
-                       mla_padded_head_size, prefill_workspace, reserve_splitk_workspace, flashinfer_workspace)
+                       mla_padded_head_size, alloc_prefill_workspace, reserve_splitk_workspace,
+                       alloc_flashinfer_workspace)
 
 
 class Qwen3_5MLAAttention(nn.Module):
@@ -196,14 +197,12 @@ class Qwen3_5MLAAttention(nn.Module):
             v_head_dim=self.head_dim, q_lora_rank=None, kv_lora_rank=kv_lora_rank,
             kv_b_proj=self.kv_b_proj, cache_config=cache_config, quant_config=quant_config,
             prefix=f"{prefix}.attn", attn_backend=QwenMLATritonBackend)
-        # Scratch the builders will use, allocated now so the memory profile counts it (see prefill_workspace).
+        # Scratch the builders will use, allocated now so the memory profile counts it (see alloc_prefill_workspace).
         cfg = self.mla_attn._vllm_config
         rows = chunked_workspace_rows(cfg)
-        prefill_workspace(cfg, rows, 0, torch.bfloat16)
-        spec = cfg.speculative_config
-        q_rows = 1 + ((2 if spec.parallel_drafting else 1) * (spec.num_speculative_tokens or 0) if spec else 0)
-        reserve_splitk_workspace(cfg, self.num_heads, kv_lora_rank, cfg.scheduler_config.max_num_seqs * q_rows)
-        flashinfer_workspace(cfg, config.num_attention_heads // get_tensor_model_parallel_world_size(), self.head_dim)
+        alloc_prefill_workspace(cfg)
+        reserve_splitk_workspace(cfg)
+        alloc_flashinfer_workspace(cfg, self.num_heads, self.head_dim)
         # The profile run reserves one context chunk as rows x heads x (nope + v), vLLM's kv_nope alone. Per
         # head, a chunk's attention holds kv_nope (nope + v), k (nope + rope) and the backend's padded v
         # (nope + rope): 966 vs 454 here. When a context needs more than one chunk, the next chunk's kv_nope

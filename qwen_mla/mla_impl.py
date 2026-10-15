@@ -60,7 +60,8 @@ from .prefill_align import patch_prefill_backend
 
 
 def chunked_workspace_rows(vllm_config) -> int:
-    """Rows of the chunked-prefill context workspace: vLLM's rule without its one-page-per-sequence floor.
+    """Rows of the chunked-prefill context workspace: vLLM's rule with the 64k cap lowered to 16k, and
+    without its one-page-per-sequence floor.
 
     vLLM sizes it min(max(8 x max_model_len, 4 x max_num_seqs x page), 64k) and then floors it at
     max_num_seqs x page, so every prefill can get a page-aligned chunk. Our pages are 784 tokens, so
@@ -68,12 +69,16 @@ def chunked_workspace_rows(vllm_config) -> int:
     group, and a 16 GB simulated up-projection in the profile run, which OOMs before serving. Our
     gather (ops/mla_gather.py) handles chunk starts at any token, so build() drops the page
     alignment and one row per prefill is the real floor.
+
+    The cap: a context chunk peaks at heads x 1164 x 2 bytes per row (see Qwen3_5MLAAttention), which the
+    profile reserves out of the KV cache. 64k rows is 3.4 GiB at 24 heads; 16k is 0.85 GiB and served a
+    103k-token prefill at 0.94 on a 24 GB card (2026-10-15).
     """
     import os
     sched, model = vllm_config.scheduler_config, vllm_config.model_config
     if os.environ.get("QWEN_MLA_PREFILL_WS_ROWS"):          # testing: force many unaligned context chunks
         return max(int(os.environ["QWEN_MLA_PREFILL_WS_ROWS"]), sched.max_num_seqs)
-    return max(min(8 * model.max_model_len, 64 * 1024), sched.max_num_seqs)
+    return max(min(8 * model.max_model_len, 16 * 1024), sched.max_num_seqs)
 
 
 def splitk_cap(batch: int, heads: int, lse_dim: int, splits: int) -> int:
@@ -111,24 +116,28 @@ def splitk_reserve_bytes(batch: int, heads: int, lse_dim: int, splits: int) -> i
 _prefill_ws = None
 
 
-def prefill_workspace(vllm_config, rows: int, width: int, dtype, device=None):
-    """The chunked-prefill context scratch as a [rows, width] view of ONE buffer shared by every group.
-
-    Layers run one at a time, so one buffer at the widest cache row serves all of them.
-    """
+def alloc_prefill_workspace(vllm_config) -> None:
+    """Allocate the chunked-prefill context scratch ONCE for every MLA group: layers run one at a time."""
     global _prefill_ws
-    if _prefill_ws is None:
-        widest = max(mla_rank_by_head_size(vllm_config.model_config.hf_text_config,
-                                           vllm_config.parallel_config.tensor_parallel_size,
-                                           mla_kv_fp8(vllm_config)))
-        _prefill_ws = torch.empty(rows * widest * 2, dtype=torch.uint8, device=device)  # 2 bytes: bf16
+    if _prefill_ws is not None:
+        return
+    if vllm_config.parallel_config.enable_dbo:
+        raise NotImplementedError("MLA: the shared chunked-prefill workspace is not safe across DBO micro-batches")
+    largest = max(mla_rank_by_head_size(vllm_config.model_config.hf_text_config,       # largest padded head size
+                                        vllm_config.parallel_config.tensor_parallel_size, mla_kv_fp8(vllm_config)))
+    _prefill_ws = torch.empty(chunked_workspace_rows(vllm_config) * largest * 2, dtype=torch.uint8,  # 2 bytes: bf16
+                              device=vllm_config.device_config.device)
+
+
+def prefill_workspace(rows: int, width: int, dtype) -> torch.Tensor:
+    """A builder's [rows, width] view of the shared scratch."""
     return _prefill_ws.view(dtype)[: rows * width].view(rows, width)
 
 
 _fi_ws = None
 
 
-def flashinfer_workspace(vllm_config, num_qo_heads: int, head_dim: int) -> None:
+def alloc_flashinfer_workspace(vllm_config, num_qo_heads: int, head_dim: int) -> None:
     """Allocate FlashInfer's workspace while the model is built, and have its metadata builder use it.
 
     The MTP draft layer is standard attention (FlashInfer on sm_86), and that builder allocates its 394 MiB
@@ -136,35 +145,44 @@ def flashinfer_workspace(vllm_config, num_qo_heads: int, head_dim: int) -> None:
     prefill transients (measured +0.41 GiB at the first decode, then a context-chunk OOM, 2026-10-15).
     """
     global _fi_ws
-    if _fi_ws is not None or vllm_config.speculative_config is None:
-        return
     import vllm.envs as envs
+    if _fi_ws is not None or vllm_config.speculative_config is None or envs.VLLM_BATCH_INVARIANT:
+        return
     from vllm.v1.attention.backends import flashinfer as fi
 
-    def need(tokens, heads, dim):
+    def need(tokens, heads, dim):  # FlashInferMetadataBuilder._get_workspace_buffer's size rule
         return max(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, tokens * heads * dim * fi.FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM)
 
+    # Sized from the target model's heads/head_dim, which the Qwen3.5 MTP draft layer shares; a builder
+    # that needs more falls back to allocating its own.
     _fi_ws = torch.zeros(need(vllm_config.scheduler_config.max_num_batched_tokens, num_qo_heads, head_dim),
-                         dtype=torch.uint8)
+                         dtype=torch.uint8, device=vllm_config.device_config.device)
     orig = fi.FlashInferMetadataBuilder._get_workspace_buffer
 
     def _get_workspace_buffer(self):
-        if (self._workspace_buffer is None and not envs.VLLM_BATCH_INVARIANT and _fi_ws.is_cuda
-                and _fi_ws.numel() >= need(self.max_num_batched_tokens, self.num_qo_heads, self.head_dim)):
+        if self._workspace_buffer is None and _fi_ws.numel() >= need(self.max_num_batched_tokens, self.num_qo_heads, self.head_dim):
             self._workspace_buffer = _fi_ws
         return orig(self)
     fi.FlashInferMetadataBuilder._get_workspace_buffer = _get_workspace_buffer
 
 
-def reserve_splitk_workspace(vllm_config, heads: int, kv_lora_rank: int, decode_rows: int) -> None:
-    """Grow vLLM's shared workspace to this group's split-K accumulator (sizes: see splitk_cap)."""
+def reserve_splitk_workspace(vllm_config) -> None:
+    """Grow vLLM's shared workspace to the split-K decode accumulator of the widest layer (sizes: see splitk_cap).
+
+    Decode rows: one per query token, so max_num_seqs x (1 + draft tokens) -- spec verify steps are
+    flattened (see _build_decode), as vLLM's reorder_batch_threshold for spec-as-decode backends.
+    """
     from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
     from vllm.v1.worker.workspace import current_workspace_manager, is_workspace_manager_initialized
     from vllm.platforms import current_platform
     if not is_workspace_manager_initialized():
         return
+    hf, tp, spec = vllm_config.model_config.hf_text_config, vllm_config.parallel_config.tensor_parallel_size, \
+        vllm_config.speculative_config
+    q_rows = 1 + ((2 if spec.parallel_drafting else 1) * (spec.num_speculative_tokens or 0) if spec else 0)
     splits = _compute_num_kv_splits(vllm_config.model_config.max_model_len, current_platform.num_compute_units())
-    n = splitk_reserve_bytes(decode_rows, heads, kv_lora_rank + 1, splits)
+    n = splitk_reserve_bytes(vllm_config.scheduler_config.max_num_seqs * q_rows, hf.num_attention_heads // tp,
+                             max(mla_local_ranks(hf, tp).values()) + 1, splits)
     current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
 
 
@@ -449,8 +467,7 @@ class QwenMLATritonImpl(TritonMLAImpl):
 
         rms = flat[:, n_rope:n_rope + n_local]        # [t, local] -- tail is this rank's heads
 
-        # k BEFORE the rope gather's temporary, so the temporary's hole is freed at the end of the
-        # block the profile reserved and the backend's padded v fits there next.
+        # k before the rope gather's temporary, whose hole then frees at the end of the reserved block.
         k = torch.empty((t, n_local, k_nope.shape[-1] + self.mla_rope_dim),
                         dtype=k_nope.dtype, device=k_nope.device)
         k[..., : k_nope.shape[-1]] = k_nope
@@ -602,11 +619,11 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         self.metadata_cls = MLAMetadata
 
         w = self.chunked_prefill_workspace
-        rows, dt, dev = chunked_workspace_rows(vllm_config), w.dtype, w.device
+        rows, dt = chunked_workspace_rows(vllm_config), w.dtype
         del w
         self.chunked_prefill_workspace = None            # release the parent's
         self.chunked_prefill_workspace_size = rows
-        self.chunked_prefill_workspace = prefill_workspace(vllm_config, rows, kv_cache_spec.head_size, dt, dev)
+        self.chunked_prefill_workspace = prefill_workspace(rows, kv_cache_spec.head_size, dt)
 
         # ---- decode context parallelism ------------------------------------------------
         # The config gates are removable (see qwen_mla/__init__.py), and with them removed
@@ -681,9 +698,7 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
     def _reserve_attn_logits_workspace(self) -> None:
         # The parent reserves the split-K accumulator at max_num_seqs x max-context splits; see
         # splitk_cap for why that cannot stand. forward_mqa caps its splits by the same budget.
-        # Decode rows: one per query token (spec verify steps are flattened, see _build_decode).
-        reserve_splitk_workspace(self.vllm_config, self.num_heads * self.dcp_world_size, self.mla_dims.kv_lora_rank,
-                                 self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
+        reserve_splitk_workspace(self.vllm_config)       # already done at model build; a no-op here
 
     def _build_decode(self, block_table_tensor, seq_lens_device, max_seq_len, query_start_loc_cpu,
                       query_start_loc_device, num_decode_tokens, dcp_tot_seq_lens_device):
