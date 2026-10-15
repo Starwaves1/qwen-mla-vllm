@@ -76,6 +76,10 @@ def patch_prefill_backend(backend) -> None:
         def _wrap(fn, pos):
             @functools.wraps(fn)
             def inner(self, *a, **kw):
+                if getattr(self, "requires_v_padding", False):
+                    # The backend pads v into a fresh (so aligned) tensor itself; copying it first as well
+                    # put two copies next to kv_nope, the peak of a context chunk (OOM 2026-10-15).
+                    return fn(self, *a, **kw)
                 if "v" in kw:
                     kw["v"] = align16(kw["v"])
                 elif len(a) > pos:

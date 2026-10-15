@@ -203,11 +203,11 @@ class Qwen3_5MLAAttention(nn.Module):
         spec = cfg.speculative_config
         q_rows = 1 + ((2 if spec.parallel_drafting else 1) * (spec.num_speculative_tokens or 0) if spec else 0)
         reserve_splitk_workspace(cfg, self.num_heads, kv_lora_rank, cfg.scheduler_config.max_num_seqs * q_rows)
-        # The profile run reserves one context chunk as rows x heads x (nope + v), vLLM's kv_nope alone. Ours
-        # also holds k (nope + rope), its rms-divided copy and the gathered rope while kv_nope is alive
-        # (_concat_k_nope_k_pe): 1024 vs 454 elements per head. Simulate the real peak, or the KV cache takes
-        # the difference and a long-context prefill OOMs at runtime.
-        live = (self.nope_dim + self.head_dim) + 2 * (self.nope_dim + self.rope_dim) + self.rope_dim
+        # The profile run reserves one context chunk as rows x heads x (nope + v), vLLM's kv_nope alone. The
+        # chunk's attention also holds k (nope + rope) and the backend's padded copy of v (nope + rope wide)
+        # while kv_nope is alive: 966 vs 454 elements per head. Simulate that peak, or the KV cache takes the
+        # difference and a long-context prefill OOMs at runtime.
+        live = (self.nope_dim + self.head_dim) + 2 * (self.nope_dim + self.rope_dim)
         self.mla_attn._chunked_prefill_workspace_size = -(-rows * live // (self.nope_dim + self.head_dim))
         self.mla_attn.impl.rms_offset = self.rms_offset
         self.mla_attn.impl.mla_kv_fp8 = self.kv_fp8

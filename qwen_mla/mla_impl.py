@@ -423,7 +423,7 @@ class QwenMLATritonImpl(TritonMLAImpl):
                         dtype=k_nope.dtype, device=k_nope.device)
         k[..., : k_nope.shape[-1]] = k_nope
         k[..., k_nope.shape[-1]:] = rope.to(k_nope.dtype)
-        return k / rms.unsqueeze(-1).to(k.dtype).clamp(min=1e-6)
+        return k.div_(rms.unsqueeze(-1).to(k.dtype).clamp(min=1e-6))   # in place: a copy is another 0.75 GiB at 64k rows
 
     def _mla_narrow_q(self, q: torch.Tensor) -> torch.Tensor:
         """Narrow q from the packed 280-wide pe to this head's own 64.
