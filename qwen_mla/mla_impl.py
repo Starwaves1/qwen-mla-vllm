@@ -125,6 +125,37 @@ def prefill_workspace(vllm_config, rows: int, width: int, dtype, device=None):
     return _prefill_ws.view(dtype)[: rows * width].view(rows, width)
 
 
+_fi_ws = None
+
+
+def flashinfer_workspace(vllm_config, num_qo_heads: int, head_dim: int) -> None:
+    """Allocate FlashInfer's workspace while the model is built, and have its metadata builder use it.
+
+    The MTP draft layer is standard attention (FlashInfer on sm_86), and that builder allocates its 394 MiB
+    workspace at the first request: after the KV cache is sized, out of the block the profile reserved for
+    prefill transients (measured +0.41 GiB at the first decode, then a context-chunk OOM, 2026-10-15).
+    """
+    global _fi_ws
+    if _fi_ws is not None or vllm_config.speculative_config is None:
+        return
+    import vllm.envs as envs
+    from vllm.v1.attention.backends import flashinfer as fi
+
+    def need(tokens, heads, dim):
+        return max(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, tokens * heads * dim * fi.FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM)
+
+    _fi_ws = torch.zeros(need(vllm_config.scheduler_config.max_num_batched_tokens, num_qo_heads, head_dim),
+                         dtype=torch.uint8)
+    orig = fi.FlashInferMetadataBuilder._get_workspace_buffer
+
+    def _get_workspace_buffer(self):
+        if (self._workspace_buffer is None and not envs.VLLM_BATCH_INVARIANT and _fi_ws.is_cuda
+                and _fi_ws.numel() >= need(self.max_num_batched_tokens, self.num_qo_heads, self.head_dim)):
+            self._workspace_buffer = _fi_ws
+        return orig(self)
+    fi.FlashInferMetadataBuilder._get_workspace_buffer = _get_workspace_buffer
+
+
 def reserve_splitk_workspace(vllm_config, heads: int, kv_lora_rank: int, decode_rows: int) -> None:
     """Grow vLLM's shared workspace to this group's split-K accumulator (sizes: see splitk_cap)."""
     from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
@@ -416,13 +447,14 @@ class QwenMLATritonImpl(TritonMLAImpl):
         flat = k_pe.reshape(t, -1)
         g = self._mla_group_of_local_head(n_local, k_nope.device)
 
-        rope = flat[:, :n_rope].view(t, -1, self.mla_rope_dim)[:, g, :]   # [t, local, 64|58]
         rms = flat[:, n_rope:n_rope + n_local]        # [t, local] -- tail is this rank's heads
 
+        # k BEFORE the rope gather's temporary, so the temporary's hole is freed at the end of the
+        # block the profile reserved and the backend's padded v fits there next.
         k = torch.empty((t, n_local, k_nope.shape[-1] + self.mla_rope_dim),
                         dtype=k_nope.dtype, device=k_nope.device)
         k[..., : k_nope.shape[-1]] = k_nope
-        k[..., k_nope.shape[-1]:] = rope.to(k_nope.dtype)
+        k[..., k_nope.shape[-1]:] = flat[:, :n_rope].view(t, -1, self.mla_rope_dim)[:, g, :]  # [t, local, 64|58]
         return k.div_(rms.unsqueeze(-1).to(k.dtype).clamp(min=1e-6))   # in place: a copy is another 0.75 GiB at 64k rows
 
     def _mla_narrow_q(self, q: torch.Tensor) -> torch.Tensor:

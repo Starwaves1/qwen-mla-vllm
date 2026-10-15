@@ -42,7 +42,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from .partial_rope import patch_partial_rope, rope_keep_from_config
 
 from .mla_impl import (QwenMLATritonBackend, chunked_workspace_rows, mla_fp8_rms_bf16, mla_gla_split, mla_kv_fp8,
-                       mla_padded_head_size, prefill_workspace, reserve_splitk_workspace)
+                       mla_padded_head_size, prefill_workspace, reserve_splitk_workspace, flashinfer_workspace)
 
 
 class Qwen3_5MLAAttention(nn.Module):
@@ -203,11 +203,14 @@ class Qwen3_5MLAAttention(nn.Module):
         spec = cfg.speculative_config
         q_rows = 1 + ((2 if spec.parallel_drafting else 1) * (spec.num_speculative_tokens or 0) if spec else 0)
         reserve_splitk_workspace(cfg, self.num_heads, kv_lora_rank, cfg.scheduler_config.max_num_seqs * q_rows)
-        # The profile run reserves one context chunk as rows x heads x (nope + v), vLLM's kv_nope alone. The
-        # chunk's attention also holds k (nope + rope) and the backend's padded copy of v (nope + rope wide)
-        # while kv_nope is alive: 966 vs 454 elements per head. Simulate that peak, or the KV cache takes the
-        # difference and a long-context prefill OOMs at runtime.
-        live = (self.nope_dim + self.head_dim) + 2 * (self.nope_dim + self.rope_dim)
+        flashinfer_workspace(cfg, config.num_attention_heads // get_tensor_model_parallel_world_size(), self.head_dim)
+        # The profile run reserves one context chunk as rows x heads x (nope + v), vLLM's kv_nope alone. Per
+        # head, a chunk's attention holds kv_nope (nope + v), k (nope + rope) and the backend's padded v
+        # (nope + rope): 966 vs 454 here. When a context needs more than one chunk, the next chunk's kv_nope
+        # is allocated while the previous kv_nope and k are still bound in vLLM's loop: 454 + 256 + 454 =
+        # 1164. Simulate the real peak, or the KV cache takes the difference and long prefills OOM at runtime.
+        qk, kv = self.nope_dim + self.rope_dim, self.nope_dim + self.head_dim
+        live = kv + qk + (kv if cfg.model_config.max_model_len > rows else qk)
         self.mla_attn._chunked_prefill_workspace_size = -(-rows * live // (self.nope_dim + self.head_dim))
         self.mla_attn.impl.rms_offset = self.rms_offset
         self.mla_attn.impl.mla_kv_fp8 = self.kv_fp8
