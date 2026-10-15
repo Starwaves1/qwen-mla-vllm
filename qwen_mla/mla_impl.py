@@ -101,6 +101,42 @@ def splitk_reserve_bytes(batch: int, heads: int, lse_dim: int, splits: int) -> i
     return min(full, max(budget, batch * heads * lse_dim * 4))
 
 
+# MEMORY THE PROFILER MUST SEE. vLLM sizes the KV cache from a profile run that happens before any
+# metadata builder exists, so scratch that builders allocate is never counted. vLLM expects one MLA
+# group, which keeps that small; our per-layer ranks give one group (and one builder) PER LAYER. At
+# 64k rows and 120k context that was 16 chunked-prefill workspaces (2 GiB) plus a 512 MiB split-K
+# reservation, allocated after the KV cache was sized, so graph capture OOMed at 0.94 (2026-10-15).
+# Both are now allocated while the model is built, which the profiler counts, and builders reuse them.
+
+_prefill_ws = None
+
+
+def prefill_workspace(vllm_config, rows: int, width: int, dtype, device=None):
+    """The chunked-prefill context scratch as a [rows, width] view of ONE buffer shared by every group.
+
+    Layers run one at a time, so one buffer at the widest cache row serves all of them.
+    """
+    global _prefill_ws
+    if _prefill_ws is None:
+        widest = max(mla_rank_by_head_size(vllm_config.model_config.hf_text_config,
+                                           vllm_config.parallel_config.tensor_parallel_size,
+                                           mla_kv_fp8(vllm_config)))
+        _prefill_ws = torch.empty(rows * widest * 2, dtype=torch.uint8, device=device)  # 2 bytes: bf16
+    return _prefill_ws.view(dtype)[: rows * width].view(rows, width)
+
+
+def reserve_splitk_workspace(vllm_config, heads: int, kv_lora_rank: int, decode_rows: int) -> None:
+    """Grow vLLM's shared workspace to this group's split-K accumulator (sizes: see splitk_cap)."""
+    from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
+    from vllm.v1.worker.workspace import current_workspace_manager, is_workspace_manager_initialized
+    from vllm.platforms import current_platform
+    if not is_workspace_manager_initialized():
+        return
+    splits = _compute_num_kv_splits(vllm_config.model_config.max_model_len, current_platform.num_compute_units())
+    n = splitk_reserve_bytes(decode_rows, heads, kv_lora_rank + 1, splits)
+    current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
+
+
 def mla_kv_fp8(vllm_config=None) -> bool:
     """True when the KV cache is FP8 (--kv-cache-dtype fp8*): the row layout changes (rms tail as bf16 bytes)."""
     if vllm_config is None:
@@ -536,9 +572,9 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
         w = self.chunked_prefill_workspace
         rows, dt, dev = chunked_workspace_rows(vllm_config), w.dtype, w.device
         del w
-        self.chunked_prefill_workspace = None            # release the parent's before allocating
+        self.chunked_prefill_workspace = None            # release the parent's
         self.chunked_prefill_workspace_size = rows
-        self.chunked_prefill_workspace = _torch.empty((rows, kv_cache_spec.head_size), dtype=dt, device=dev)
+        self.chunked_prefill_workspace = prefill_workspace(vllm_config, rows, kv_cache_spec.head_size, dt, dev)
 
         # ---- decode context parallelism ------------------------------------------------
         # The config gates are removable (see qwen_mla/__init__.py), and with them removed
@@ -613,17 +649,9 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
     def _reserve_attn_logits_workspace(self) -> None:
         # The parent reserves the split-K accumulator at max_num_seqs x max-context splits; see
         # splitk_cap for why that cannot stand. forward_mqa caps its splits by the same budget.
-        from vllm.v1.attention.backends.mla.triton_mla import _compute_num_kv_splits
-        from vllm.v1.worker.workspace import current_workspace_manager, is_workspace_manager_initialized
-        from vllm.platforms import current_platform
-        if not is_workspace_manager_initialized():
-            return
         # Decode rows: one per query token (spec verify steps are flattened, see _build_decode).
-        B = self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold
-        H = self.num_heads * self.dcp_world_size
-        splits = _compute_num_kv_splits(self.model_config.max_model_len, current_platform.num_compute_units())
-        n = splitk_reserve_bytes(B, H, self.mla_dims.kv_lora_rank + 1, splits)
-        current_workspace_manager().get_simultaneous(((n // 4,), torch.float32))
+        reserve_splitk_workspace(self.vllm_config, self.num_heads * self.dcp_world_size, self.mla_dims.kv_lora_rank,
+                                 self.vllm_config.scheduler_config.max_num_seqs * self.reorder_batch_threshold)
 
     def _build_decode(self, block_table_tensor, seq_lens_device, max_seq_len, query_start_loc_cpu,
                       query_start_loc_device, num_decode_tokens, dcp_tot_seq_lens_device):
