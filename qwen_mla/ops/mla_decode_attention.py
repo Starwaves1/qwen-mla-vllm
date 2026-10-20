@@ -854,8 +854,9 @@ def _decode_mla_two_pass(q, k_buffer, att_out, req_to_token, b_seq_len, num_kv_s
     """
     import os as _o
     B, H = q.shape[0], q.shape[1]
-    BLOCK_N = 16                       # tl.dot K >= 16, and PAGE_SIZE % 16 == 0 keeps tiles in one page
-    assert page_size % BLOCK_N == 0, "two-pass decode needs page_size % 16 == 0"
+    BLOCK_N = int(_o.environ.get("QWEN_MLA_2P_BN", 16))   # tl.dot K >= 16; PAGE_SIZE % BLOCK_N keeps tiles in one page
+    if page_size % BLOCK_N:
+        BLOCK_N = 16                                           # the caller checked page_size % 16
     BLOCK_H = max(16, triton.next_power_of_2(H))
     # Defaults measured at batch 38 / ctx 16.6k / 24 heads / 32 splits on RTX PRO 6000: 3.92 ms/layer vs
     # 7.63 single-pass (DC 128/DVC 256: 4.26; DC 64/DVC 128: 4.51; warps/stages: flat).
