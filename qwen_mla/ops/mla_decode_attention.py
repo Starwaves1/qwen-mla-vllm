@@ -941,7 +941,7 @@ def _decode_grouped_att_m_fwd(
     # BLOCK_H 4, which re-reads the latent once per 4 heads; use the two-pass kernels instead.
     # Large-smem devices (H100) keep the single-pass path. QWEN_MLA_TWO_PASS=0 disables it.
     import os as _os2
-    if (is_mla and not is_hip_ and Lv >= 1536 and _small_smem(q.device)
+    if (is_mla and not is_hip_ and Lv >= int(_os2.environ.get("QWEN_MLA_2P_MIN_LV", 1536)) and _small_smem(q.device)
             and _os2.environ.get("QWEN_MLA_TWO_PASS", "1") != "0" and page_size % 16 == 0):
         return _decode_mla_two_pass(q, k_buffer, att_out, Req_to_tokens, B_Seqlen, num_kv_splits,
                                     sm_scale, page_size, rms_offset, logit_cap, Lk, Lv,
