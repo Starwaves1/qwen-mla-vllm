@@ -30,8 +30,10 @@ def _load():
     if not os.path.exists(so):
         os.makedirs(bdir, exist_ok=True)
         tmp = so + f".{os.getpid()}.tmp"
-        subprocess.run([os.environ.get("NVCC", "nvcc"), "-O3", "-arch=sm_86", "-std=c++17", "--use_fast_math", "-shared", "-Xcompiler", "-fPIC",
-                        "-o", tmp, _SRC], check=True, timeout=600)
+        r = subprocess.run([os.environ.get("NVCC", "nvcc"), "-O3", "-arch=sm_86", "-std=c++17", "--use_fast_math", "-diag-suppress", "128",
+                            "-shared", "-Xcompiler", "-fPIC", "-o", tmp, _SRC], capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"nvcc failed for {_SRC}:\n{r.stderr[-4000:]}")
         os.replace(tmp, so)
     lib = ctypes.CDLL(so)
     lib.mla_int8_decode.restype = ctypes.c_int
