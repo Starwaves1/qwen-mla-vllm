@@ -10,7 +10,25 @@ import qwen_mla.ops.mla_int8_cuda as CU
 import test_int8_decode as T
 dev = T.dev; H = 24; SM = T.SM
 
-def run(rank, page, Ls, kind='real', nsplit=4, bn=None, mode=1, seed=0, fp8=False, rot=0):
+def poison_tail(cache, bt, Ls, rank, page):
+    """Overwrite every token >= L of each request's pages with 0xFF bytes (fp16 NaN scales, int8 -1): masked keys
+    must not leak into the output."""
+    tb = I.token_bytes(rank)
+    for r, L in enumerate(Ls):
+        for pi in range(bt.shape[1]):
+            lo = max(0, L - pi * page)
+            if lo >= page:
+                continue
+            pg = int(bt[r, pi])
+            o = 0
+            for width in (rank, 256, 2, 2):                  # latent, rope, sigma, rho: token-major [page, width]
+                cache[pg, o + lo * width:o + page * width] = 255
+                o += page * width
+            v = cache[pg, o:o + 24 * page].view(24, page)   # rms [24, page]
+            v[:, lo:] = 255
+
+
+def run(rank, page, Ls, kind='real', nsplit=4, bn=None, mode=1, seed=0, fp8=False, rot=0, poison=False):
     bn = bn or int(os.environ.get('BN', 16 if rank == 1792 else 32))
     NMV = 1 if rank == 1792 else int(os.environ.get('NM', 3))
     ctx = max(Ls); nreq = len(Ls)
@@ -20,6 +38,8 @@ def run(rank, page, Ls, kind='real', nsplit=4, bn=None, mode=1, seed=0, fp8=Fals
     else:
         lat_k, q_k = lat, q
     cache = I.pack_cache(lat_k, rp, rms)
+    if poison:
+        poison_tail(cache, bt, Ls, rank, page)
     lens = torch.tensor(Ls, dtype=torch.int32, device=dev)
     lens_rows = torch.tensor([L - 3 + j for L in Ls for j in range(4)], dtype=torch.int32, device=dev)
     btr = bt.repeat_interleave(4, 0).contiguous()
@@ -75,9 +95,10 @@ def main(rank, what):
         for kind in ('real', 'diffuse', 'peaky'):
             r = run(rank, page, [5000, 1700], kind, nsplit=4, fp8=bool(int(os.environ.get('FP8', 1))), rot=rot)
             print(f'rot={rot} {rank} {kind} ' + ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)
-        for Ls, ns in (([1, 2, 3, 4], 2), ([40, 100, 3, 1700], 13), ([1664, 1665, 3328, 33], 5)):
-            r = run(rank, page, Ls, 'real', nsplit=ns, fp8=False, rot=rot)
-            print(f'edge {Ls} ns={ns} ' + ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)
+        for Ls, ns, poison in (([1, 2, 3, 4], 2, False), ([40, 100, 3, 1700], 13, False), ([1664, 1665, 3328, 33], 5, False),
+                               ([1, 37, 1665, 2500], 7, True)):
+            r = run(rank, page, Ls, 'real', nsplit=ns, fp8=False, rot=rot, poison=poison)
+            print(f'edge {Ls} ns={ns}{" poisoned tail" if poison else ""} ' + ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)
 
 
 if __name__ == '__main__':
