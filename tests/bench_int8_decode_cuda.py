@@ -52,7 +52,7 @@ for c in cs:
             nhb = 24 // (4 * nm)
             for wv in (1, 2, 3):
                 sp = max(1, min(SMS * wv // (nhb * c), ctx // 256))
-                op = torch.empty(c * 96 * sp * rank, device=dev); lp = torch.empty(c * 96 * sp, device=dev)
+                op = torch.empty(c * 96 * sp * rank, dtype=torch.float16, device=dev); lp = torch.empty(c * 96 * sp, device=dev)
                 cu.append((timeit(lambda: (I.prep_q(q, rank, 1 / 16.0, out=qq), CU.int8_decode_cuda(*qq, ci, bti, lensi, rank, PI, sp, o, lse, bn=bn,
                                                                                                     nm=nm, opart=op, lsepart=lp))), nm, sp))
         tb, cb = min(tri), min(cu)

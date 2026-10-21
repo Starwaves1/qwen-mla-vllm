@@ -30,7 +30,7 @@ constexpr int MAGIC_I = 0;
 struct Params {
   const int8_t* q8; const float* qs; const int8_t* qr8; const float* qrs;
   const uint8_t* cache; const int* bt; const int* lens;
-  float* opart; float* lsepart; float* sdbg;
+  __half* opart; float* lsepart; float* sdbg;   // opart: normalised split outputs in fp16 (bounded by max |latent|)
   long long page_bytes; int stride_bt; int nsplit; int page; int ld_dbg;
 };
 
@@ -556,12 +556,14 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
 #pragma unroll
     for (int i = 0; i < NA; ++i) { l_g += lsum[(m * 16 + g) * NA + i]; l_h += lsum[(m * 16 + g + 8) * NA + i]; }
     const float ig = l_g > 0.f ? 1.f / l_g : 0.f, ih = l_h > 0.f ? 1.f / l_h : 0.f;
-    float* og = p.opart + ((size_t)(qrow0 + g) * p.nsplit + split) * R + c * CW + 4 * t;
-    float* oh = p.opart + ((size_t)(qrow0 + g + 8) * p.nsplit + split) * R + c * CW + 4 * t;
+    __half* og = p.opart + ((size_t)(qrow0 + g) * p.nsplit + split) * R + c * CW + 4 * t;
+    __half* oh = p.opart + ((size_t)(qrow0 + g + 8) * p.nsplit + split) * R + c * CW + 4 * t;
 #pragma unroll
     for (int ch = 0; ch < CH; ++ch) {
-      *reinterpret_cast<float4*>(og + ch * 16) = make_float4(acc[ch][0] * ig, acc[ch][1] * ig, acc[ch][2] * ig, acc[ch][3] * ig);
-      *reinterpret_cast<float4*>(oh + ch * 16) = make_float4(acc[ch][4] * ih, acc[ch][5] * ih, acc[ch][6] * ih, acc[ch][7] * ih);
+      const __half2 g01 = __floats2half2_rn(acc[ch][0] * ig, acc[ch][1] * ig), g23 = __floats2half2_rn(acc[ch][2] * ig, acc[ch][3] * ig);
+      const __half2 h01 = __floats2half2_rn(acc[ch][4] * ih, acc[ch][5] * ih), h23 = __floats2half2_rn(acc[ch][6] * ih, acc[ch][7] * ih);
+      *reinterpret_cast<uint2*>(og + ch * 16) = make_uint2(*reinterpret_cast<const uint32_t*>(&g01), *reinterpret_cast<const uint32_t*>(&g23));
+      *reinterpret_cast<uint2*>(oh + ch * 16) = make_uint2(*reinterpret_cast<const uint32_t*>(&h01), *reinterpret_cast<const uint32_t*>(&h23));
     }
     if (c == 0 && t == 0) {
       p.lsepart[(qrow0 + g) * p.nsplit + split] = l_g > 0.f ? m_g + log2f(l_g) : -INFINITY;
@@ -590,7 +592,7 @@ extern "C" int mla_int8_decode(const void* q8, const void* qs, const void* qr8, 
                                long long page_bytes, int stride_bt, int nsplit, int page, int nreq, int rank, int bn,
                                int nm, int mode, void* stream) {
   Params p{(const int8_t*)q8, (const float*)qs, (const int8_t*)qr8, (const float*)qrs, (const uint8_t*)cache,
-           (const int*)bt, (const int*)lens, (float*)opart, (float*)lsepart, (float*)sdbg,
+           (const int*)bt, (const int*)lens, (__half*)opart, (float*)lsepart, (float*)sdbg,
            page_bytes, stride_bt, nsplit, page, ld_dbg};
   cudaStream_t s = (cudaStream_t)stream;
 #define DISPATCH(R_, BN_, NM_, NC_, NS_, MB_)                                                                     \

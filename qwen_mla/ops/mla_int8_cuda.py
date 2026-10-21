@@ -11,6 +11,7 @@ import subprocess
 
 import torch
 import triton
+import triton.language as tl
 
 from . import mla_int8_decode as I
 
@@ -39,6 +40,30 @@ def _load():
     return lib
 
 
+@triton.jit
+def _reduce_kernel(Opart, LSEpart, Out, LseOut, R: tl.constexpr, NSPLIT: tl.constexpr, NSP: tl.constexpr, DB: tl.constexpr):
+    """Combine the fp16 split outputs: one program per (query row, DB columns); all splits loaded as one block."""
+    qrow = tl.program_id(0)                       # (req, head, j) in prep_q order
+    db = tl.program_id(1)
+    j = qrow % 4
+    head = (qrow // 4) % 24
+    req = qrow // 96
+    sp = tl.arange(0, NSP)
+    lse = tl.load(LSEpart + qrow * NSPLIT + sp, mask=sp < NSPLIT, other=float("-inf"))
+    m = tl.max(lse, 0)
+    m_s = tl.where(m == float("-inf"), 0.0, m)
+    w = tl.exp2(lse - m_s)
+    wsum = tl.sum(w, 0)
+    d = db * DB + tl.arange(0, DB)
+    x = tl.load(Opart + (qrow.to(tl.int64) * NSPLIT + sp[:, None]) * R + d[None, :], mask=(sp[:, None] < NSPLIT) & (w[:, None] > 0),
+                other=0.0).to(tl.float32)
+    acc = tl.sum(x * w[:, None], 0) / tl.where(wsum > 0, wsum, 1.0)
+    orow = req * 4 + j
+    tl.store(Out + (orow * 24 + head) * R + d, acc.to(Out.dtype.element_ty))
+    if db == 0:
+        tl.store(LseOut + orow * 24 + head, tl.where(wsum > 0, (m_s + tl.log2(wsum)) * 0.6931471805599453, float("-inf")))
+
+
 SMS = 82   # RTX 3090; one CTA per SM for every config except (256, bn 32, nm 2) which runs 2
 
 
@@ -65,7 +90,7 @@ def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsp
         bn, nm, nsplit = bn or pbn, nm or pnm, nsplit or psp
     assert page % bn == 0 and block_table.dtype == torch.int32 and lens.dtype == torch.int32
     if opart is None:
-        opart = torch.empty(nreq * I.HEADS * I.ROWS * nsplit * rank, dtype=torch.float32, device=q8.device)
+        opart = torch.empty(nreq * I.HEADS * I.ROWS * nsplit * rank, dtype=torch.float16, device=q8.device)
     if lsepart is None:
         lsepart = torch.empty(nreq * I.HEADS * I.ROWS * nsplit, dtype=torch.float32, device=q8.device)
     stream = torch.cuda.current_stream(q8.device).cuda_stream
@@ -77,7 +102,8 @@ def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsp
         raise RuntimeError(f"mla_int8_decode failed: {err}")
     if mode == 0:
         return opart, lsepart
-    I._int8_reduce_kernel[(nreq * I.HEADS * I.ROWS,)](
-        opart, lsepart, out, lse_out, R=rank, RP=triton.next_power_of_2(rank), NSPLIT=nsplit,
-        NSP=triton.next_power_of_2(nsplit), num_warps=4)
+    assert opart.dtype == torch.float16
+    db = 128 if rank % 128 == 0 else 64
+    _reduce_kernel[(nreq * I.HEADS * I.ROWS, rank // db)](
+        opart, lsepart, out, lse_out, R=rank, NSPLIT=nsplit, NSP=triton.next_power_of_2(nsplit), DB=db, num_warps=2)
     return out, lse_out
