@@ -345,6 +345,14 @@ def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1, fp8: bool = Fa
         cand.append((sum(rows[r] * counts[r] for r in ranks) / sum(counts.values()), rows))
     if cand:
         rows = min(cand, key=lambda t: t[0])[1]
+        # QWEN_MLA_MAX_PAGE_RATIO=2 widens the smallest rows so no layer's page holds more than twice the
+        # tokens of the widest layer's. Prefix-cache hits align to the lcm of the per-layer block sizes:
+        # 1:2:4 rows give blocks of 4x/2x/1x tokens (832/1664/3328 on the 3090 with FP8), so every hit loses
+        # up to 3328 tokens of re-prefill; capping the ratio at 2 halves that for ~6% of KV pool here.
+        ratio = int(os.environ.get("QWEN_MLA_MAX_PAGE_RATIO", 0))
+        if ratio > 0:
+            mx = max(rows.values())
+            rows = {r: max(v, mx // ratio) for r, v in rows.items()}
         if kv_lora_rank in rows:
             return rows[kv_lora_rank]
     return _pow2(raw)
