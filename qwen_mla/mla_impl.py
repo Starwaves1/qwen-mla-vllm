@@ -320,8 +320,9 @@ def int8_draft_kernel_block_padding() -> None:
     init = ow.OffloadingConnectorWorker._init_worker
 
     def _init_worker(self, kv_caches):
+        # every ref, mapped or not: the copy size is ref.page_size_bytes (cpu/gpu_worker.py); padding bytes ride along
         full = [[dataclasses.replace(r, page_size_bytes=kv_caches.tensors[r.tensor_idx].page_size_bytes)
-                 if r.mapping is None else r for r in refs] for refs in kv_caches.group_data_refs]
+                 for r in refs] for refs in kv_caches.group_data_refs]
         return init(self, dataclasses.replace(kv_caches, group_data_refs=full))
     ow.OffloadingConnectorWorker._init_worker = _init_worker
 
