@@ -280,13 +280,50 @@ def mla_int8_kv() -> bool:
 
     Page layout, decode kernel and writer: ops/mla_int8_decode.py, csrc/mla_int8_decode.cu, ops/mla_int8_write.py.
     Experimental, TP=1 and the 24-head / 4 x 58 rope geometry only. Off by default.
-    KNOWN GAP (page geometry): with an MTP draft layer (FlashInfer, 832 x 2048 B pages) the widest int8-tok page (832 x 2112 B)
-    is no longer a multiple of the draft's. vLLM then doubles the draft block (1664 tokens) and pads every MLA page to that
-    3.4 MB page by block stride (the kernels here take the stride), which roughly halves the KV pool. Padding the draft page
-    instead would need a draft backend that runs whole 832-token pages (FlashInfer splits them into <= 64-token kernel blocks
-    and vLLM's padded view then overruns the cache; Triton attention has no FP8 KV on sm_86).
+    Page geometry: the widest int8-tok page (832 x 2112 B) is the maximum and the MTP draft's (832 x 2048 B, FlashInfer) does
+    not divide it, so the draft page is padded (3%); MLA pages are declared unpaddable so vLLM does not double the draft block
+    and pad every MLA page instead (that halved the KV pool). See int8_draft_kernel_block_padding for the draft side.
     """
     return os.environ.get("QWEN_MLA_INT8_KV") == "1"
+
+
+def int8_draft_kernel_block_padding() -> None:
+    """vLLM pads the MTP draft's page (QWEN_MLA_INT8_KV) but views it as if kernel block = manager block: FlashInfer runs
+    64-token kernel blocks, 13 per 832-token page, and the padded view then strides whole pages per kernel block and overruns
+    the cache (setStorage out of bounds at startup). Spread the padding over the kernel blocks instead: stride = padded page
+    / 13 (1,757,184 / 13 = 135,168 B, 4 KB of padding after each 64-token kernel block). Exact or untouched: only when the
+    padded page divides by the split count."""
+    import types
+    import vllm.v1.worker.gpu_model_runner as gmr
+    orig = gmr._reshape_attention_kv_cache
+    if getattr(orig, "_qwen_mla_int8", False):
+        return
+
+    def _reshape_attention_kv_cache(kv_raw_tensor, kv_cache_spec, kv_cache_shape, kv_cache_stride_order, num_blocks,
+                                    packing):
+        pad = getattr(kv_cache_spec, "page_size_padded", None)
+        if pad is not None and packing is None:
+            pages = kv_raw_tensor.numel() * kv_raw_tensor.element_size() // pad
+            splits = num_blocks // pages if pages else 1
+            if splits > 1 and num_blocks == pages * splits and pad % splits == 0:
+                kv_cache_spec = types.SimpleNamespace(page_size_padded=pad // splits, page_size_bytes=pad // splits,
+                                                      dtype=kv_cache_spec.dtype)
+        return orig(kv_raw_tensor, kv_cache_spec, kv_cache_shape, kv_cache_stride_order, num_blocks, packing)
+    _reshape_attention_kv_cache._qwen_mla_int8 = True
+    gmr._reshape_attention_kv_cache = _reshape_attention_kv_cache
+
+    # The CPU offloading tier copies only the UNPADDED page bytes of each layer (1,703,936 of the draft's 1,757,184), which
+    # with the padding spread over the kernel blocks cuts off the tail of the last kernel block: draft KV restored from the
+    # CPU tier was garbage (MTP acceptance 1.00 after CPU-tier hits, 2.85 after GPU hits). Copy whole pages instead.
+    import dataclasses
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import worker as ow
+    init = ow.OffloadingConnectorWorker._init_worker
+
+    def _init_worker(self, kv_caches):
+        full = [[dataclasses.replace(r, page_size_bytes=kv_caches.tensors[r.tensor_idx].page_size_bytes)
+                 if r.mapping is None else r for r in refs] for refs in kv_caches.group_data_refs]
+        return init(self, dataclasses.replace(kv_caches, group_data_refs=full))
+    ow.OffloadingConnectorWorker._init_worker = _init_worker
 
 
 def _int8_rows(hf, tp_size: int) -> dict[int, int]:
@@ -860,6 +897,14 @@ class QwenMLATritonBackend(TritonMLABackend):
     @staticmethod
     def get_name() -> str:
         return "QWEN_MLA_TRITON"
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        # int8-tok: MLA pages must not be paddable, or vLLM doubles the MTP draft's block and pads every MLA page to it
+        # (measured: half the KV pool). The draft page is padded instead (int8_draft_kernel_block_padding).
+        if mla_int8_kv():
+            return False
+        return super().indexes_kv_by_block_stride()
 
     @staticmethod
     def get_impl_cls() -> type[QwenMLATritonImpl]:
