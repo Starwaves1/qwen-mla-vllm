@@ -135,7 +135,8 @@ if __name__ == '__main__':
     if cases == 'basic':
         for rot in (0, 1):
             for rank, page in ((768, 1664), (256, 1664), (1792, 832)):
-                kw = dict(hb=4, bn=32, acc16=True) if rank == 1792 else dict(hb=8, bn=64)
+                kw = {1792: dict(hb=8, bn=32, acc16=True, qin=True), 768: dict(hb=8, bn=64, acc16=True),
+                      256: dict(hb=8, bn=128, acc16=True)}[rank]
                 for kind in ('real', 'diffuse', 'peaky'):
                     r = case(2, 5000, rank, page, kind, nsplit=4, Ls=[5000, 1700], rot=rot, **kw)
                     print(f'rot={rot}', rank, kind, ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)

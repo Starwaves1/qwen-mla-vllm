@@ -180,7 +180,7 @@ def _int8_decode_kernel(
     Q8, QS, QR8, QRS, Cache, BT, Lens, Opart, LSEpart, stride_bt,
     R: tl.constexpr, PAGE: tl.constexpr, HB: tl.constexpr, M: tl.constexpr, BN: tl.constexpr, DC: tl.constexpr,
     NC: tl.constexpr, RW: tl.constexpr, NSPLIT: tl.constexpr, PV_INT8: tl.constexpr, PSCALE: tl.constexpr,
-    ACC16: tl.constexpr, EARLY: tl.constexpr,
+    ACC16: tl.constexpr, EARLY: tl.constexpr, QIN: tl.constexpr,
 ):
     hb = tl.program_id(0)
     split = tl.program_id(1)
@@ -277,6 +277,21 @@ def _int8_decode_kernel(
             if NC > 6:
                 qk = tl.dot(q6, tl.trans(k6), qk, out_dtype=tl.int32)
         else:
+            if QIN:   # re-read q every tile (L1/L2 hit) instead of keeping it resident in shared memory
+                qp = Q8 + (start_n >> 30) + qrow[:, None] * R + dc[None, :]   # loop-variant offset (always 0)
+                q0 = tl.load(qp, mask=rvalid[:, None], other=0)
+                if NC > 1:
+                    q1 = tl.load(qp + DC, mask=rvalid[:, None], other=0)
+                if NC > 2:
+                    q2 = tl.load(qp + 2 * DC, mask=rvalid[:, None], other=0)
+                if NC > 3:
+                    q3 = tl.load(qp + 3 * DC, mask=rvalid[:, None], other=0)
+                if NC > 4:
+                    q4 = tl.load(qp + 4 * DC, mask=rvalid[:, None], other=0)
+                if NC > 5:
+                    q5 = tl.load(qp + 5 * DC, mask=rvalid[:, None], other=0)
+                if NC > 6:
+                    q6 = tl.load(qp + 6 * DC, mask=rvalid[:, None], other=0)
             k0, qk = _qk_chunk(q0, pb, tok, tl.zeros([M, BN], tl.int32), 0, R, DC)
             if NC > 1:
                 k1, qk = _qk_chunk(q1, pb, tok, qk, 1, R, DC)
@@ -387,11 +402,11 @@ def _int8_reduce_kernel(Opart, LSEpart, Out, LseOut, R: tl.constexpr, RP: tl.con
 
 
 def int8_decode(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, out, lse_out, hb=8, bn=64,
-                pv_int8=False, num_warps=8, num_stages=1, opart=None, lsepart=None, acc16=False, early=False):
+                pv_int8=False, num_warps=8, num_stages=1, opart=None, lsepart=None, acc16=False, early=False, qin=False):
     """cache uint8 [NP, page_bytes]; block_table int32 [nreq, pages]; lens int32 [nreq] = length of row 3.
     out [nreq*4, 24, rank] (row 4i+j), lse_out [nreq*4, 24] (natural log)."""
     nreq = q8.shape[0]
-    assert page % bn == 0 and rank % 256 == 0 or rank <= 256
+    assert page % bn == 0 and (rank % 256 == 0 or rank <= 256)
     DC = min(256, rank)
     NC = rank // DC
     nhb = -(-HEADS // hb)
@@ -406,7 +421,7 @@ def int8_decode(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, 
     _int8_decode_kernel[(nhb, nsplit, nreq)](
         q8, qs, qr8, qrs, cache.view(torch.int8), block_table, lens, opart, lsepart, block_table.stride(0),
         R=rank, PAGE=page, HB=hb, M=M, BN=bn, DC=DC, NC=NC, RW=RW, NSPLIT=nsplit, PV_INT8=int(pv_int8),
-        PSCALE=psc, ACC16=int(acc16), EARLY=int(early), num_warps=num_warps, num_stages=num_stages)
+        PSCALE=psc, ACC16=int(acc16), EARLY=int(early), QIN=int(qin), num_warps=num_warps, num_stages=num_stages)
     _int8_reduce_kernel[(nreq * HEADS * ROWS,)](
         opart, lsepart, out, lse_out, R=rank, RP=triton.next_power_of_2(rank), NSPLIT=nsplit,
         NSP=triton.next_power_of_2(nsplit), num_warps=4)
