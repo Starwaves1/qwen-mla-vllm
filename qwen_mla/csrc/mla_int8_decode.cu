@@ -276,62 +276,83 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
       for (int k = 0; k < XPT; ++k)
         if ((LPT + k) % 6 == sidx && x_has[k]) cp_async16(nsb + x_soff[k], npb + x_goff[k] + (size_t)ntip * x_tokmul[k]);
     };
-    // ---- QK partial over this warp's column slice (+ rope k-step), scaled to fp32; all n-tiles per k-step (ILP)
+    // ---- QK partial over this warp's column slice (+ rope k-step), scaled to fp32, stored per n-tile pair
     constexpr int NP = NT / 2;
-    float own[NT][4];
-    {
+    constexpr bool KSO = NM <= 2;   // k-step outer (4 independent chains) when registers allow, n-tile pair outer otherwise
+    const int krow = ((lane >> 4) << 3) + (lane & 7);
+    const uint32_t la = sb + krow * C::LSTR + c * CW + ((lane >> 3) & 1) * 16;
+    auto qk_pair_out = [&](int np, const int (&s0)[4], const int (&s1)[4]) {
+      float o[2][4];
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int nt = 2 * np + h;
+        const int (&sa)[4] = h ? s1 : s0;
+        const float2 sg = __half22float2(*reinterpret_cast<const __half2*>(st + C::SIG + (8 * nt + 2 * t) * 2));
+        o[h][0] = i2f(sa[0]) * (qs_g * sg.x); o[h][1] = i2f(sa[1]) * (qs_g * sg.y);
+        o[h][2] = i2f(sa[2]) * (qs_h * sg.x); o[h][3] = i2f(sa[3]) * (qs_h * sg.y);
+      }
+      if (has_rope) {
+        int ra[2][4];
+        uint32_t b0, b1, b2, b3;
+        ldsm4(sb + C::ROPE + (np * 16 + krow) * C::RSTR + rlg * 64 + rks * 32 + ((lane >> 3) & 1) * 16, b0, b1, b2, b3);
+        mma_s8c(ra[0], qra, b0, b1, 0);
+        mma_s8c(ra[1], qra, b2, b3, 0);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int nt = 2 * np + h;
+          const float2 rh = __half22float2(*reinterpret_cast<const __half2*>(st + C::RHO + (8 * nt + 2 * t) * 2));
+          o[h][0] = fmaf(i2f(ra[h][0]), qrs_g * rh.x, o[h][0]);
+          o[h][1] = fmaf(i2f(ra[h][1]), qrs_g * rh.y, o[h][1]);
+          o[h][2] = fmaf(i2f(ra[h][2]), qrs_h * rh.x, o[h][2]);
+          o[h][3] = fmaf(i2f(ra[h][3]), qrs_h * rh.y, o[h][3]);
+        }
+      }
+#pragma unroll
+      for (int h = 0; h < 2; ++h)
+        part[((m * NC + c) * NT + 2 * np + h) * 32 + lane] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
+    };
+    if constexpr (KSO) {
       int sa[NT][4];
-      const int krow = ((lane >> 4) << 3) + (lane & 7);
-      const uint32_t la = sb + krow * C::LSTR + c * CW + ((lane >> 3) & 1) * 16;
-      // k-step outer (4 independent chains, more ILP) when registers allow, n-tile pair outer otherwise
-      constexpr bool KSO = NM <= 2;
 #pragma unroll
-      for (int o = 0; o < (KSO ? KS : NP); ++o) {
+      for (int ks = 0; ks < KS; ++ks) {
 #pragma unroll
-        for (int i = 0; i < (KSO ? NP : KS); ++i) {
-          const int ks = KSO ? o : i, np = KSO ? i : o;
+        for (int np = 0; np < NP; ++np) {
           uint32_t b0, b1, b2, b3;
           ldsm4(la + np * 16 * C::LSTR + ks * 32, b0, b1, b2, b3);
           if (ks == 0) {
-            mma_s8c(sa[2 * np], qa[ks], b0, b1, MAGIC_I);
-            mma_s8c(sa[2 * np + 1], qa[ks], b2, b3, MAGIC_I);
+            mma_s8c(sa[2 * np], qa[ks], b0, b1, 0);
+            mma_s8c(sa[2 * np + 1], qa[ks], b2, b3, 0);
           } else {
             mma_s8(sa[2 * np], qa[ks], b0, b1);
             mma_s8(sa[2 * np + 1], qa[ks], b2, b3);
           }
+        }
+        if (ks == 0) slot(0);
+        if (ks == KS / 2) slot(1);
+      }
+#pragma unroll
+      for (int np = 0; np < NP; ++np) qk_pair_out(np, sa[2 * np], sa[2 * np + 1]);
+    } else {
+#pragma unroll
+      for (int np = 0; np < NP; ++np) {
+        int s0[4], s1[4];
+#pragma unroll
+        for (int ks = 0; ks < KS; ++ks) {
+          uint32_t b0, b1, b2, b3;
+          ldsm4(la + np * 16 * C::LSTR + ks * 32, b0, b1, b2, b3);
+          if (ks == 0) {
+            mma_s8c(s0, qa[ks], b0, b1, 0);
+            mma_s8c(s1, qa[ks], b2, b3, 0);
+          } else {
+            mma_s8(s0, qa[ks], b0, b1);
+            mma_s8(s1, qa[ks], b2, b3);
+          }
           if (np == 0 && ks == 0) slot(0);
           if (np == NP - 1 && ks == KS / 2) slot(1);
         }
-      }
-#pragma unroll
-      for (int nt = 0; nt < NT; ++nt) {
-        const float2 sg = __half22float2(*reinterpret_cast<const __half2*>(st + C::SIG + (8 * nt + 2 * t) * 2));
-        own[nt][0] = i2f(sa[nt][0]) * (qs_g * sg.x); own[nt][1] = i2f(sa[nt][1]) * (qs_g * sg.y);
-        own[nt][2] = i2f(sa[nt][2]) * (qs_h * sg.x); own[nt][3] = i2f(sa[nt][3]) * (qs_h * sg.y);
+        qk_pair_out(np, s0, s1);
       }
     }
-    if (has_rope) {
-      int ra[NT][4];
-      const int krow = ((lane >> 4) << 3) + (lane & 7);
-#pragma unroll
-      for (int np = 0; np < NP; ++np) {
-        uint32_t b0, b1, b2, b3;
-        ldsm4(sb + C::ROPE + (np * 16 + krow) * C::RSTR + rlg * 64 + rks * 32 + ((lane >> 3) & 1) * 16, b0, b1, b2, b3);
-        mma_s8c(ra[2 * np], qra, b0, b1, MAGIC_I);
-        mma_s8c(ra[2 * np + 1], qra, b2, b3, MAGIC_I);
-      }
-#pragma unroll
-      for (int nt = 0; nt < NT; ++nt) {
-        const float2 rh = __half22float2(*reinterpret_cast<const __half2*>(st + C::RHO + (8 * nt + 2 * t) * 2));
-        own[nt][0] = fmaf(i2f(ra[nt][0]), qrs_g * rh.x, own[nt][0]);
-        own[nt][1] = fmaf(i2f(ra[nt][1]), qrs_g * rh.y, own[nt][1]);
-        own[nt][2] = fmaf(i2f(ra[nt][2]), qrs_h * rh.x, own[nt][2]);
-        own[nt][3] = fmaf(i2f(ra[nt][3]), qrs_h * rh.y, own[nt][3]);
-      }
-    }
-#pragma unroll
-    for (int nt = 0; nt < NT; ++nt)
-      part[((m * NC + c) * NT + nt) * 32 + lane] = make_float4(own[nt][0], own[nt][1], own[nt][2], own[nt][3]);
     slot(2);
     TICK(2)
     bar_group(1 + m, NC * 32);                               // B2 (row tile m only): partials and inv-rms ready
