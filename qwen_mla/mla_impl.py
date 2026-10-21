@@ -275,6 +275,39 @@ def mla_local_ranks(hf, tp_size: int = 1) -> dict[int, int]:
     return {int(k): int(v) // g for k, v in hf.mla_ranks.items()}
 
 
+def mla_int8_kv() -> bool:
+    """QWEN_MLA_INT8_KV=1 (with --kv-cache-dtype fp8): the one-byte cache holds int8-tok pages instead of e4m3 rows.
+
+    Page layout, decode kernel and writer: ops/mla_int8_decode.py, csrc/mla_int8_decode.cu, ops/mla_int8_write.py.
+    Experimental, TP=1 and the 24-head / 4 x 58 rope geometry only. Off by default.
+    KNOWN GAP (page geometry): with an MTP draft layer (FlashInfer, 832 x 2048 B pages) the widest int8-tok page (832 x 2112 B)
+    is no longer a multiple of the draft's. vLLM then doubles the draft block (1664 tokens) and pads every MLA page to that
+    3.4 MB page by block stride (the kernels here take the stride), which roughly halves the KV pool. Padding the draft page
+    instead would need a draft backend that runs whole 832-token pages (FlashInfer splits them into <= 64-token kernel blocks
+    and vLLM's padded view then overruns the cache; Triton attention has no FP8 KV on sm_86).
+    """
+    return os.environ.get("QWEN_MLA_INT8_KV") == "1"
+
+
+def _int8_rows(hf, tp_size: int) -> dict[int, int]:
+    """Row widths (bytes per token) for int8-tok pages: rank + 284 (ops/mla_int8_decode.token_bytes), each the
+    widest row divided by a power of two so pages unify by block size; QWEN_MLA_MAX_PAGE_RATIO caps that power.
+    At ratio 2: 1056 / 1056 / 2112 for ranks 256 / 768 / 1792 (FP8: 1024 / 1024 / 2048)."""
+    import math
+    from .ops.mla_int8_decode import token_bytes
+    if tp_size != 1 or hf.num_attention_heads != 24:
+        raise NotImplementedError("QWEN_MLA_INT8_KV: TP=1 and 24 heads only")
+    ranks = sorted(set(mla_local_ranks(hf, tp_size).values()))
+    tb = {r: token_bytes(r) for r in ranks}
+    top = max(tb.values())
+    ratio = int(os.environ.get("QWEN_MLA_MAX_PAGE_RATIO", 0))
+    kmax = ratio.bit_length() - 1 if ratio > 0 else 30
+    k = {r: min(kmax, max(0, round(math.log2(top / tb[r])))) for r in ranks}
+    align = 16 << max(k.values())
+    w = -(-max(tb[r] << k[r] for r in ranks) // align) * align
+    return {r: w >> k[r] for r in ranks}
+
+
 def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1, fp8: bool = False) -> int:
     """Cache row width for a layer, padded so every layer's PAGE divides the largest.
 
@@ -293,6 +326,8 @@ def mla_padded_head_size(hf, kv_lora_rank: int, tp_size: int = 1, fp8: bool = Fa
     The padding sits past the rms tail and is never read: the decode kernel bounds its
     attention reads at rms_offset, and prefill slices rope/rms at explicit offsets.
     """
+    if fp8 and mla_int8_kv():
+        return _int8_rows(hf, tp_size)[kv_lora_rank]
     tail = mla_base_tail(hf, tp_size, fp8)
     base = min(mla_local_ranks(hf, tp_size).values()) + tail
     # NOTE on 16-byte alignment. The row width is also the per-token stride, so at TP=2 the
@@ -368,6 +403,14 @@ def mla_rank_by_head_size(hf, tp_size: int = 1, fp8: bool = False) -> dict[int, 
     return out
 
 
+def _int8_pages(kv_cache: torch.Tensor) -> torch.Tensor:
+    """[blocks, page_tokens, row] one-byte cache -> uint8 [blocks, page_tokens * row] with the cache's block stride
+    (pages may be padded past page_tokens * row by vLLM's page-size unification)."""
+    u8 = kv_cache.view(torch.uint8)
+    assert u8.stride(2) == 1 and u8.stride(1) == u8.shape[2], u8.stride()
+    return torch.as_strided(u8, (u8.shape[0], u8.shape[1] * u8.shape[2]), (u8.stride(0), 1))
+
+
 class QwenMLATritonImpl(TritonMLAImpl):
     """TritonMLAImpl with the rms divisor wired into decode and k_norm into prefill."""
 
@@ -381,6 +424,7 @@ class QwenMLATritonImpl(TritonMLAImpl):
     mla_packed_rope: int = 0      # width of the packed rope block (256), EXCLUDING rms + pad
 
     mla_kv_fp8: bool = False        # FP8 cache: rms tail stored as raw bf16 bytes after the rope block
+    mla_int8: bool = False          # QWEN_MLA_INT8_KV: the one-byte cache holds int8-tok pages (mla_int8_kv)
 
     def __init__(self, *args, **kwargs):
         # vLLM refuses an FP8 cache for the Triton MLA backend below SM89 (Triton has no fp8e4nv there).
@@ -409,6 +453,14 @@ class QwenMLATritonImpl(TritonMLAImpl):
         rms as two bytes each. Device ops with static shapes only (runs inside CUDA graphs); padding
         tokens (slot -1) are redirected to slot 0, which belongs to vLLM's never-used null block.
         """
+        if self.mla_int8:
+            if kv_cache.numel() == 0:
+                return
+            from .ops.mla_int8_write import mla_int8_cache_write
+            slots = slot_mapping.flatten()
+            n = slots.shape[0]                     # kv_c / k_pe may carry CUDA-graph padding rows beyond the slots
+            return mla_int8_cache_write(kv_c_normed[:n], k_pe.reshape(k_pe.shape[0], -1)[:n], _int8_pages(kv_cache),
+                                        slots, kv_cache.shape[1])
         if (self.rms_offset < 0 or not str(kv_cache_dtype).startswith("fp8")
                 or mla_fp8_rms_mode() == "e4m3"):
             return super().do_kv_cache_update(kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale)
@@ -517,16 +569,59 @@ class QwenMLATritonImpl(TritonMLAImpl):
         # parent resolves `ops.gather_and_maybe_dequant_cache` at call time.
         import vllm._custom_ops as _ops
         orig = _ops.gather_and_maybe_dequant_cache
-        _ops.gather_and_maybe_dequant_cache = (
-            functools.partial(gather_cache_torch, mla_rms=(self.rms_offset, self.mla_local_heads,
-                                                          mla_fp8_rms_mode()))
-            if self.mla_kv_fp8 else gather_cache_torch)
+        if self.mla_int8:
+            from .ops.mla_int8_write import mla_int8_gather
+            _ops.gather_and_maybe_dequant_cache = functools.partial(mla_int8_gather, rank=self.kv_lora_rank,
+                                                                    pages_of=_int8_pages)
+        else:
+            _ops.gather_and_maybe_dequant_cache = (
+                functools.partial(gather_cache_torch, mla_rms=(self.rms_offset, self.mla_local_heads,
+                                                              mla_fp8_rms_mode()))
+                if self.mla_kv_fp8 else gather_cache_torch)
         try:
             return super().forward_mha(q, *args, **kwargs)
         finally:
             _ops.gather_and_maybe_dequant_cache = orig
 
+    def _forward_mqa_int8(self, q, kv_cache, attn_metadata):
+        """int8-tok decode: q prep (Triton) + CUDA split kernel + Triton reduce, on the per-REQUEST block table.
+
+        The kernel takes 4 query rows per request (MTP k=3) with causal lengths L-3..L, so it uses the request-level
+        block table and seq_lens that _build_decode keeps next to its flattened rows. Fewer query tokens per request
+        (q < 4) sit in rows 4-q..3, the rows before them are zero queries and are dropped. The launch configuration
+        depends only on the batch shape and the block table's width (capped at 64k tokens), so it is fixed per
+        CUDA-graph bucket.
+        """
+        from .ops import mla_int8_cuda as C
+        from .ops.mla_int8_decode import prep_q
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+        dec = attn_metadata.decode
+        bt, sl = dec._mla_req_bt, dec._mla_req_sl
+        n = bt.shape[0]
+        B, H, r = q.shape[0], q.shape[1], self.kv_lora_rank
+        qn = B // n
+        assert attn_metadata.causal and qn * n == B and 1 <= qn <= 4 and H == 24, (B, n, H)
+        if qn < 4:
+            qp = q.new_zeros(n, 4, H, q.shape[-1])
+            qp[:, 4 - qn:] = q.view(n, qn, H, -1)
+            q = qp.view(n * 4, H, -1)
+        page = kv_cache.shape[1]
+        bn, nm, nsplit = C.pick_config(r, n, min(bt.shape[1] * page, 65536))
+        q8, qs, qr8, qrs = prep_q(q, r, self.scale)
+        o = torch.empty(n * 4, H, r, dtype=q.dtype, device=q.device)
+        lse = torch.empty(n * 4, H, dtype=torch.float32, device=q.device)
+        pages = _int8_pages(kv_cache)
+        C.int8_decode_cuda(q8, qs, qr8, qrs, pages, bt, sl, r, page, nsplit, o, lse, bn=bn, nm=nm,
+                           page_stride=pages.stride(0))
+        if qn < 4:
+            o = o.view(n, 4, H, r)[:, 4 - qn:].reshape(B, H, r)
+            lse = lse.view(n, 4, H)[:, 4 - qn:].reshape(B, H)
+        return o, lse
+
     def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+        if self.mla_int8:
+            return self._forward_mqa_int8(q, kv_c_and_k_pe_cache, attn_metadata)
         # QWEN_MLA_DECODE_BACKEND=flashinfer routes decode to the patched flashinfer fa2 MLA kernel
         # (~1.9x the Triton fork on the attention term). Falls
         # through to Triton for anything that path does not cover, so the fast path never has to
@@ -721,6 +816,9 @@ class MLATritonMetadataBuilder(TritonMLAMetadataBuilder):
                                    query_start_loc_device, num_decode_tokens, dcp_tot_seq_lens_device)
         n = block_table_tensor.shape[0]
         q = num_decode_tokens // n if n else 1
+        # int8-tok decode (QWEN_MLA_INT8_KV) takes the per-REQUEST rows; views of vLLM's persistent buffers.
+        object.__setattr__(md, "_mla_req_bt", block_table_tensor)
+        object.__setattr__(md, "_mla_req_sl", seq_lens_device)
         if q > 1:
             assert q * n == num_decode_tokens, (num_decode_tokens, n)
             # PERSISTENT buffers, written in place: a full CUDA graph replays reads from the addresses it

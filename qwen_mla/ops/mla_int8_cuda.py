@@ -81,10 +81,10 @@ def pick_config(rank, nreq, ctx):
 
 
 def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, out, lse_out, bn=None,
-                     opart=None, lsepart=None, mode=1, sdbg=None, nm=None):
+                     opart=None, lsepart=None, mode=1, sdbg=None, nm=None, page_stride=None):
     """cache uint8 [NP, page_bytes]; block_table int32 [nreq, pages]; lens int32 [nreq] = length of MTP row 3.
     out [nreq*4, 24, rank], lse_out [nreq*4, 24] (natural log). nsplit / bn / nm None -> pick_config(rank, nreq,
-    nsplit or the block table's capacity). mode 0 = score-only probe (sdbg [nreq*96, ld] fp32), 2 = loads only."""
+    nsplit or the block table's capacity). page_stride: bytes between pages (None = page_bytes(rank, page)). mode 0 = score-only probe (sdbg [nreq*96, ld] fp32), 2 = loads only."""
     lib = _load()
     nreq = q8.shape[0]
     if nsplit is None or bn is None or nm is None:
@@ -99,7 +99,7 @@ def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsp
     err = lib.mla_int8_decode(q8.data_ptr(), qs.data_ptr(), qr8.data_ptr(), qrs.data_ptr(), cache.data_ptr(),
                               block_table.data_ptr(), lens.data_ptr(), opart.data_ptr(), lsepart.data_ptr(),
                               sdbg.data_ptr() if sdbg is not None else None, sdbg.shape[1] if sdbg is not None else 0,
-                              I.page_bytes(rank, page), block_table.stride(0), nsplit, page, nreq, rank, bn, nm, mode, stream)
+                              page_stride or I.page_bytes(rank, page), block_table.stride(0), nsplit, page, nreq, rank, bn, nm, mode, stream)
     if err != 0:
         raise RuntimeError(f"mla_int8_decode failed: {err}")
     if mode == 0:

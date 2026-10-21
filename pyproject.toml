@@ -26,4 +26,4 @@ mvla = "qwen_mla:register"
 include = ["qwen_mla*"]
 
 [tool.setuptools.package-data]
-qwen_mla = ["kernels/*.cuh", "kernels/FLASHINFER_VERSION"]
+qwen_mla = ["kernels/*.cuh", "kernels/FLASHINFER_VERSION", "csrc/*.cu"]

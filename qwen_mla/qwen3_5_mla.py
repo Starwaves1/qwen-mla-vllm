@@ -41,7 +41,8 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from .partial_rope import patch_partial_rope, rope_keep_from_config
 
-from .mla_impl import (QwenMLATritonBackend, chunked_workspace_rows, mla_fp8_rms_bf16, mla_gla_split, mla_kv_fp8,
+from .latent_rot import mla_latent_rot
+from .mla_impl import (QwenMLATritonBackend, chunked_workspace_rows, mla_fp8_rms_bf16, mla_gla_split, mla_kv_fp8, mla_int8_kv,
                        mla_padded_head_size, alloc_prefill_workspace, reserve_splitk_workspace,
                        alloc_flashinfer_workspace)
 
@@ -215,6 +216,11 @@ class Qwen3_5MLAAttention(nn.Module):
         self.mla_attn.impl.mla_kv_fp8 = self.kv_fp8
         if self.kv_fp8:
             self._install_kv_scale(config, prefix)
+        self.mla_attn.impl.mla_int8 = self.kv_fp8 and mla_int8_kv()       # experimental, off by default
+        if self.mla_attn.impl.mla_int8:
+            self._install_int8_block()
+        if mla_latent_rot(self.mla_attn.impl.mla_int8):
+            self._install_latent_rot()
         self.mla_attn.impl.mla_local_heads = self.num_heads   # rms tail is rank-local
         self.mla_attn.impl.mla_rope_dim = self.rope_dim
         self.mla_attn.impl.mla_packed_rope = self.packed_rope
@@ -317,6 +323,35 @@ class Qwen3_5MLAAttention(nn.Module):
         out, _ = self.o_proj(attn_out)
         return out
 
+
+    def _install_int8_block(self):
+        """int8-tok rows (mla_impl._int8_rows) are wider than the MTP draft's 2048 B/token, so vLLM doubles the draft block and
+        pads every MLA page up to that page (2 x block x 2048 B; see mla_int8_kv). Give each MLA layer the largest power-of-two
+        multiple of the block whose page still fits it: 1664 tokens for the 1056 B rows, 832 for the 2112 B row (which then
+        wastes half its page). Measurement geometry, not the prod answer (that needs the int8 row to fit the draft page)."""
+        import dataclasses
+        attn, orig = self.mla_attn, self.mla_attn.get_kv_cache_spec
+
+        def get_kv_cache_spec(vllm_config):
+            spec = orig(vllm_config)
+            mc = vllm_config.model_config
+            cap = 2 * spec.block_size * 2 * mc.get_num_kv_heads(vllm_config.parallel_config) * mc.get_head_size()
+            m = 1
+            while 2 * m * spec.block_size * spec.head_size <= cap:
+                m *= 2
+            return dataclasses.replace(spec, block_size=m * spec.block_size)
+        attn.get_kv_cache_spec = get_kv_cache_spec
+
+    def _install_latent_rot(self):
+        """Fold the block-Hadamard latent rotation (latent_rot.py) into kv_a_proj / kv_b_proj / _k_up_raw right before
+        vLLM derives W_UK_T and W_UV from kv_b_proj, i.e. at the start of this layer's process_weights_after_loading."""
+        from .latent_rot import fold_latent_rotation
+        attn, orig = self.mla_attn, self.mla_attn.process_weights_after_loading
+
+        def process_weights_after_loading(*args, **kwargs):
+            fold_latent_rotation(self)
+            return orig(*args, **kwargs)
+        attn.process_weights_after_loading = process_weights_after_loading
 
     def _install_kv_scale(self, config, prefix):
         """Per-layer FP8 KV scale from config `mla_kv_cache_scales` ({layer index: amax / 448}).
