@@ -39,6 +39,7 @@ __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
 }
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void bar_group(int id, int nthr) { asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(nthr) : "memory"); }
 template <int N>
 __device__ __forceinline__ void cp_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N) : "memory"); }
 __device__ __forceinline__ void ldsm4(uint32_t a, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
@@ -213,27 +214,32 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
     if (k < ntile) issue(k, k, btr[(start + k * BN) / p.page]);
     else cp_commit();
   }
-  int pg_next = NS - 1 < ntile ? btr[(start + (NS - 1) * BN) / p.page] : 0;
+  // next tile to issue: page-table index and token-in-page tracked incrementally (no divisions in the loop)
+  int nx_pi = (start + (NS - 1) * BN) / p.page, nx_tip = (start + (NS - 1) * BN) - nx_pi * p.page;
+  int pg_next = NS - 1 < ntile ? btr[nx_pi] : 0;
   for (int it = 0; it < ntile; ++it) {
     TICK(7)
     cp_wait<NS - 2>();
     __syncthreads();                                         // B1: tile it landed; tile it-1 fully consumed
     TICK(0)
-    // next tile's copies are spread through the QK loop (an LDGSTS that finds the queue full stalls only its warp)
     const int itn = it + NS - 1;                             // tile issued during this iteration
     const bool nxt = itn < ntile;
+    const uint8_t* lgb = p.cache;                            // latent chunk base of the next tile (this thread)
     const uint8_t* npb = p.cache;
     uint32_t nsb = 0;
     int ntip = 0;
     if (nxt) {
-      ntip = (start + itn * BN) % p.page;
+      ntip = nx_tip;
       npb = p.cache + (size_t)pg_next * p.page_bytes;
+      lgb = npb + (size_t)ntip * R + l_goff;
       nsb = smem0 + (itn % NS) * C::STAGE;
-      if (itn + 1 < ntile) pg_next = btr[(start + (itn + 1) * BN) / p.page];
+      nx_tip += BN;
+      if (nx_tip == p.page) { nx_tip = 0; ++nx_pi; }
+      if (itn + 1 < ntile) pg_next = btr[nx_pi];
     }
     auto cpk = [&](int k) {
       if constexpr (LFAST) {
-        cp_async16(nsb + l_soff + k * RSTEP * C::LSTR, npb + (size_t)ntip * R + l_goff + (size_t)k * RSTEP * R);
+        cp_async16(nsb + l_soff + k * RSTEP * C::LSTR, lgb + k * RSTEP * R);
       } else {
         const int i = tid + k * NTHR, r = i / LCH, ch = i % LCH;
         if (i < BN * LCH) cp_async16(nsb + r * C::LSTR + ch * 16, npb + (size_t)(ntip + r) * R + ch * 16);
@@ -243,9 +249,14 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
     const uint8_t* st = smem + (it % NS) * C::STAGE;
     const uint32_t sb = smem_u32(st);
     const int tok0 = start + it * BN;
-    for (int i = tid; i < HBK * BN; i += NTHR) {
-      const int hl = i / BN, k = i % BN;
-      invr[hl * C::IVS + k] = exp2f(3.f - (float)st[C::RMS + hl * BN + k] * (6.f / 255.f));
+    {                                                        // 1/rms of this row tile's 4 heads, by the tile's own warps
+      const int lt = tid - m * NC * 32;
+#pragma unroll
+      for (int k0 = 0; k0 < 4 * BN; k0 += NC * 32) {
+        const int i = k0 + lt, hl = 4 * m + i / BN, k = i % BN;
+        if ((4 * BN) % (NC * 32) == 0 || i < 4 * BN)
+          invr[hl * C::IVS + k] = exp2f(3.f - (float)st[C::RMS + hl * BN + k] * (6.f / 255.f));
+      }
     }
 
     if constexpr (MODE == 2) {
@@ -323,7 +334,7 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
       part[((m * NC + c) * NT + nt) * 32 + lane] = make_float4(own[nt][0], own[nt][1], own[nt][2], own[nt][3]);
     slot(2);
     TICK(2)
-    __syncthreads();                                         // B2: partials and inv-rms ready
+    bar_group(1 + m, NC * 32);                               // B2 (row tile m only): partials and inv-rms ready
     TICK(3)
     slot(3);
 
@@ -387,7 +398,7 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
       rmx[(m * 16 + g + 8) * NA + c] = make_float2(mx_h, ux_h);
     }
     TICK(5)
-    __syncthreads();                                         // B3: per-warp row maxima ready
+    bar_group(1 + m, NC * 32);                               // B3 (row tile m): per-warp row maxima ready
     TICK(6)
     slot(4);
     mx_g = mx_h = ux_g = ux_h = -INFINITY;
@@ -423,7 +434,7 @@ __global__ void __launch_bounds__(32 * NC * NM, MINB) int8_decode_kernel(const P
       pf[(rg + 1) * 2 + hf] = (uint16_t)__byte_perm(q2, q3, 0x0040);
     }
     l_g = l_g * al_g + ps_g; l_h = l_h * al_h + ps_h;        // partial row sums (this lane's keys), reduced at the end
-    __syncthreads();                                         // B4: P (int8, A-fragment order) ready
+    bar_group(1 + m, NC * 32);                               // B4 (row tile m): P (int8, A-fragment order) ready
     slot(5);
     cp_commit();
     uint32_t pa[KBN][4];
