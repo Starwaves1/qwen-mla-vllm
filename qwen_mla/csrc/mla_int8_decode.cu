@@ -23,7 +23,6 @@
 
 namespace {
 
-constexpr int NWARP = 12, NTHR = NWARP * 32;
 constexpr int MAGIC_I = 0x4B400000;          // int32 x + MAGIC_I reinterpreted as fp32 = 1.5 * 2^23 + x (|x| < 2^22)
 constexpr float MAGIC_F = 12582912.0f;
 
@@ -53,32 +52,40 @@ __device__ __forceinline__ void mma_s8(int (&d)[4], const uint32_t (&a)[4], uint
       : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
+__device__ __forceinline__ void mma_s8c(int (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, int c) {
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};\n"
+      : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c));
+}
 __device__ __forceinline__ float i2f(int x) { return __int_as_float(x) - MAGIC_F; }
 __device__ __forceinline__ uint32_t ld32(const int8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
 
-template <int R, int BN>
+template <int R, int BN, int NM>   // NM row tiles of 16 (4 heads x 4 MTP rows) per CTA
 struct Cfg {
+  static constexpr int HBK = 4 * NM, NWARP = 4 * NM, NTHR = 32 * NWARP;
   static constexpr int LSTR = R + 16, RSTR = 144;          // padded rows: ldmatrix of 8 rows is conflict-free
   static constexpr int ROPE = BN * LSTR;
   static constexpr int SIG = ROPE + BN * RSTR;
   static constexpr int RHO = SIG + ((BN * 2 + 15) / 16) * 16;
   static constexpr int RMS = RHO + ((BN * 2 + 15) / 16) * 16;
-  static constexpr int STAGE = ((RMS + 12 * BN) + 127) / 128 * 128;
+  static constexpr int STAGE = ((RMS + HBK * BN) + 127) / 128 * 128;
   static constexpr int PART = 2 * STAGE;
-  static constexpr int PART_B = 12 * (BN / 8) * 32 * 16;
+  static constexpr int PART_B = NWARP * (BN / 8) * 32 * 16;
   static constexpr int IVS = BN + 8;                         // inv-rms row stride (floats)
   static constexpr int INVR = PART + PART_B;
-  static constexpr int RMX = INVR + 12 * IVS * 4;          // float2 [3 m][16 rows][4 c] (row max, max log2 p*sigma)
-  static constexpr int PFR = RMX + 3 * 16 * 4 * 8;          // uint32 [3 m][BN / 32][32 lanes][4]: P int8 A fragments
-  static constexpr int LSUM = PFR + 3 * (BN / 32) * 32 * 16; // float [48 rows][4 c]
-  static constexpr int SMEM = LSUM + 48 * 4 * 4;
+  static constexpr int RMX = INVR + HBK * IVS * 4;         // float2 [NM][16 rows][4 c] (row max, max log2 p*sigma)
+  static constexpr int PFR = RMX + NM * 16 * 4 * 8;         // uint32 [NM][BN / 32][32 lanes][4]: P int8 A fragments
+  static constexpr int LSUM = PFR + NM * (BN / 32) * 32 * 16; // float [16 NM rows][4 c]
+  static constexpr int SMEM = LSUM + 16 * NM * 4 * 4;
 };
 
-template <int R, int BN, int MODE>   // MODE 0: QK + softmax-free score pass (debug / pipeline probe), 1: full
-__global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
-  using C = Cfg<R, BN>;
+template <int R, int BN, int NM, int MODE>   // MODE 0: QK + softmax-free score pass (debug / pipeline probe), 1: full
+__global__ void __launch_bounds__(32 * 4 * NM, 1) int8_decode_kernel(const Params p) {
+  using C = Cfg<R, BN, NM>;
+  constexpr int NTHR = C::NTHR, HBK = C::HBK;
   constexpr int NT = BN / 8, KB = BN / 32, CW = R / 4, KS = CW / 32, CH = CW / 16;
   static_assert(KS * 32 * 127 * 127 < (1 << 22), "QK partial exceeds the magic-number range");
+  static_assert((BN / 16) * (R / 128) >= (BN * R / 16 + NTHR - 1) / NTHR, "QK loop has a slot for every latent copy");
   extern __shared__ __align__(128) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   const int m = warp >> 2, c = warp & 3;
@@ -88,7 +95,8 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
   const int start = split * per;
   const int end = min(start + per, L);
   const int ntile = end > start ? (end - start + BN - 1) / BN : 0;
-  const int qrow0 = (req * 24 + hb * 12) * 4 + 16 * m;
+  const int qrow0 = (req * 24 + hb * HBK) * 4 + 16 * m;
+  const int g0 = (hb * HBK) / 6;                   // first KV group of the block; the block spans groups g0, g0 + 1
 
   uint32_t qa[KS][4];
   {
@@ -102,13 +110,14 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
   }
   // rope k-steps: row tile 0 = heads 0-3 (local KV group 0), 1 = heads 4-7 (groups 0, 1), 2 = heads 8-11 (group 1)
   int rlg = -1, rks = 0;
-  if (m == 0 && c < 2) { rlg = 0; rks = c; }
+  if (NM == 2) { rlg = c >> 1; rks = c & 1; }      // 8-head blocks: every row tile may touch both groups
+  else if (m == 0 && c < 2) { rlg = 0; rks = c; }
   else if (m == 1) { rlg = c >> 1; rks = c & 1; }
   else if (m == 2 && c >= 2) { rlg = 1; rks = c - 2; }
   const bool has_rope = rlg >= 0;
   uint32_t qra[4] = {0u, 0u, 0u, 0u};
   if (has_rope) {
-    const int8_t* rg = p.qr8 + (size_t)(qrow0 + g) * 256 + (2 * hb + rlg) * 64 + rks * 32 + 4 * t;
+    const int8_t* rg = p.qr8 + (size_t)(qrow0 + g) * 256 + (g0 + rlg) * 64 + rks * 32 + 4 * t;
     qra[0] = ld32(rg); qra[1] = ld32(rg + 8 * 256); qra[2] = ld32(rg + 16); qra[3] = ld32(rg + 8 * 256 + 16);
   }
   const float qs_g = p.qs[qrow0 + g], qs_h = p.qs[qrow0 + g + 8];
@@ -122,26 +131,31 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
   constexpr int LCH = R / 16, RSTEP = NTHR / LCH;
   constexpr bool LFAST = NTHR % LCH == 0 && BN % RSTEP == 0;   // rows r0 + k * RSTEP, fixed column chunk
   constexpr int LPT = LFAST ? BN / RSTEP : (BN * LCH + NTHR - 1) / NTHR;
-  static_assert(BN * 8 + BN / 4 + 12 * (BN / 16) <= NTHR, "one small chunk per thread");
   const int lr0 = tid / LCH, lch = tid - (tid / LCH) * LCH;
   const uint32_t l_soff = lr0 * C::LSTR + lch * 16;
   const uint32_t l_goff = lr0 * R + lch * 16;
-  // small chunk: rope rows (tid < BN*8), then sigma, rho, rms
-  uint32_t x_soff = 0; long long x_goff = 0; int x_tokmul = 0; bool x_has = true;
-  if (tid < BN * 8) {
-    const int r = tid >> 3, ch = tid & 7;
-    x_soff = C::ROPE + r * C::RSTR + ch * 16; x_goff = (long long)p.page * R + r * 256 + hb * 128 + ch * 16; x_tokmul = 256;
-  } else if (tid < BN * 8 + BN / 8) {
-    const int ch = tid - BN * 8;
-    x_soff = C::SIG + ch * 16; x_goff = (long long)p.page * (R + 256) + ch * 16; x_tokmul = 2;
-  } else if (tid < BN * 8 + BN / 4) {
-    const int ch = tid - BN * 8 - BN / 8;
-    x_soff = C::RHO + ch * 16; x_goff = (long long)p.page * (R + 258) + ch * 16; x_tokmul = 2;
-  } else if (tid < BN * 8 + BN / 4 + 12 * (BN / 16)) {
-    const int i = tid - BN * 8 - BN / 4, hl = i / (BN / 16), ch = i % (BN / 16);
-    x_soff = C::RMS + hl * BN + ch * 16; x_goff = (long long)p.page * (R + 260) + (long long)(12 * hb + hl) * p.page + ch * 16; x_tokmul = 1;
-  } else {
-    x_has = false;
+  constexpr int NX = BN * 8 + BN / 4 + HBK * (BN / 16), XPT = (NX + NTHR - 1) / NTHR;
+  // small chunks j: rope rows (j < BN*8), then sigma, rho, rms
+  uint32_t x_soff[XPT]; long long x_goff[XPT]; int x_tokmul[XPT]; bool x_has[XPT];
+#pragma unroll
+  for (int k = 0; k < XPT; ++k) {
+    const int j = tid + k * NTHR;
+    x_has[k] = true; x_soff[k] = 0; x_goff[k] = 0; x_tokmul[k] = 0;
+    if (j < BN * 8) {
+      const int r = j >> 3, ch = j & 7;
+      x_soff[k] = C::ROPE + r * C::RSTR + ch * 16; x_goff[k] = (long long)p.page * R + r * 256 + g0 * 64 + ch * 16; x_tokmul[k] = 256;
+    } else if (j < BN * 8 + BN / 8) {
+      const int ch = j - BN * 8;
+      x_soff[k] = C::SIG + ch * 16; x_goff[k] = (long long)p.page * (R + 256) + ch * 16; x_tokmul[k] = 2;
+    } else if (j < BN * 8 + BN / 4) {
+      const int ch = j - BN * 8 - BN / 8;
+      x_soff[k] = C::RHO + ch * 16; x_goff[k] = (long long)p.page * (R + 258) + ch * 16; x_tokmul[k] = 2;
+    } else if (j < NX) {
+      const int i = j - BN * 8 - BN / 4, hl = i / (BN / 16), ch = i % (BN / 16);
+      x_soff[k] = C::RMS + hl * BN + ch * 16; x_goff[k] = (long long)p.page * (R + 260) + (long long)(HBK * hb + hl) * p.page + ch * 16; x_tokmul[k] = 1;
+    } else {
+      x_has[k] = false;
+    }
   }
   const uint32_t smem0 = smem_u32(smem);
   auto issue = [&](int it, int stg, int pg) {
@@ -159,7 +173,8 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
         if (i < BN * LCH) cp_async16(sb + r * C::LSTR + ch * 16, pb + (size_t)(tip + r) * R + ch * 16);
       }
     }
-    if (x_has && EXP != 4) cp_async16(sb + x_soff, pb + x_goff + (size_t)tip * x_tokmul);
+#pragma unroll
+    for (int k = 0; k < XPT; ++k) if (x_has[k] && EXP != 4) cp_async16(sb + x_soff[k], pb + x_goff[k] + (size_t)tip * x_tokmul[k]);
     cp_commit();
   };
 
@@ -192,66 +207,112 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
     cp_wait_all();
     __syncthreads();                                         // B1: tile it landed; tile it-1 fully consumed
     TICK(0)
-    if (it + 1 < ntile) {
-      issue(it + 1, (it + 1) & 1, pg_next);
+    // next tile's copies are spread through the QK loop (an LDGSTS that finds the queue full stalls only its warp)
+    const bool nxt = it + 1 < ntile;
+    const uint8_t* npb = p.cache;
+    uint32_t nsb = 0;
+    int ntip = 0;
+    if (nxt) {
+      ntip = (start + (it + 1) * BN) % p.page;
+      npb = p.cache + (size_t)pg_next * p.page_bytes;
+      nsb = smem0 + ((it + 1) & 1) * C::STAGE;
       if (it + 2 < ntile) pg_next = btr[(start + (it + 2) * BN) / p.page];
     }
+    auto cpk = [&](int k) {
+      if constexpr (LFAST) {
+        cp_async16(nsb + l_soff + k * RSTEP * C::LSTR, npb + (size_t)ntip * R + l_goff + (size_t)k * RSTEP * R);
+      } else {
+        const int i = tid + k * NTHR, r = i / LCH, ch = i % LCH;
+        if (i < BN * LCH) cp_async16(nsb + r * C::LSTR + ch * 16, npb + (size_t)(ntip + r) * R + ch * 16);
+      }
+    };
     TICK(1)
     const uint8_t* st = smem + (it & 1) * C::STAGE;
     const uint32_t sb = smem_u32(st);
     const int tok0 = start + it * BN;
-    for (int i = tid; i < 12 * BN; i += NTHR) {
+    for (int i = tid; i < HBK * BN; i += NTHR) {
       const int hl = i / BN, k = i % BN;
       invr[hl * C::IVS + k] = exp2f(3.f - (float)st[C::RMS + hl * BN + k] * (6.f / 255.f));
     }
 
-    if constexpr (MODE == 2) { __syncthreads(); continue; }
-    // ---- QK partial over this warp's column slice (+ rope k-step), scaled to fp32
+    if constexpr (MODE == 2) {
+      for (int k = 0; k < LPT; ++k) if (nxt) cpk(k);
+#pragma unroll
+      for (int k = 0; k < XPT; ++k) if (nxt && x_has[k]) cp_async16(nsb + x_soff[k], npb + x_goff[k] + (size_t)ntip * x_tokmul[k]);
+      cp_commit();
+      __syncthreads();
+      continue;
+    }
+    // copies of tile it+1 are spread over 6 points of this tile (bursts of LDGSTS stall the issuing warps)
+    auto slot = [&](int sidx) {
+      if (!nxt || EXP == 4) return;
+#pragma unroll
+      for (int k = 0; k < LPT; ++k) if (k % 6 == sidx) cpk(k);
+#pragma unroll
+      for (int k = 0; k < XPT; ++k)
+        if ((LPT + k) % 6 == sidx && x_has[k]) cp_async16(nsb + x_soff[k], npb + x_goff[k] + (size_t)ntip * x_tokmul[k]);
+    };
+    // ---- QK partial over this warp's column slice (+ rope k-step), scaled to fp32; all n-tiles per k-step (ILP)
+    constexpr int NP = NT / 2;
     float own[NT][4];
+    {
+      int sa[NT][4];
+      const int krow = ((lane >> 4) << 3) + (lane & 7);
+      const uint32_t la = sb + krow * C::LSTR + c * CW + ((lane >> 3) & 1) * 16;
+      // k-step outer (4 independent chains, more ILP) when registers allow, n-tile pair outer otherwise
+      constexpr bool KSO = NM <= 2;
 #pragma unroll
-    for (int np = 0; np < NT / 2; ++np) {
-      int sa[2][4] = {{MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I}, {MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I}};
-      const int key = np * 16 + ((lane >> 4) << 3) + (lane & 7);
-      const uint32_t la = sb + key * C::LSTR + c * CW + ((lane >> 3) & 1) * 16;
+      for (int o = 0; o < (KSO ? KS : NP); ++o) {
 #pragma unroll
-      for (int ks = 0; ks < KS; ++ks) {
-        uint32_t b0, b1, b2, b3;
-        ldsm4(la + ks * 32, b0, b1, b2, b3);
-        mma_s8(sa[0], qa[ks], b0, b1);
-        mma_s8(sa[1], qa[ks], b2, b3);
-      }
-#pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int nt = 2 * np + h;
-        const float2 sg = __half22float2(*reinterpret_cast<const __half2*>(st + C::SIG + (8 * nt + 2 * t) * 2));
-        own[nt][0] = i2f(sa[h][0]) * (qs_g * sg.x); own[nt][1] = i2f(sa[h][1]) * (qs_g * sg.y);
-        own[nt][2] = i2f(sa[h][2]) * (qs_h * sg.x); own[nt][3] = i2f(sa[h][3]) * (qs_h * sg.y);
-      }
-      if (has_rope) {
-        int ra[2][4] = {{MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I}, {MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I}};
-        uint32_t b0, b1, b2, b3;
-        ldsm4(sb + C::ROPE + key * C::RSTR + rlg * 64 + rks * 32 + ((lane >> 3) & 1) * 16, b0, b1, b2, b3);
-        mma_s8(ra[0], qra, b0, b1);
-        mma_s8(ra[1], qra, b2, b3);
-#pragma unroll
-        for (int h = 0; h < 2; ++h) {
-          const int nt = 2 * np + h;
-          const float2 rh = __half22float2(*reinterpret_cast<const __half2*>(st + C::RHO + (8 * nt + 2 * t) * 2));
-          own[nt][0] = fmaf(i2f(ra[h][0]), qrs_g * rh.x, own[nt][0]);
-          own[nt][1] = fmaf(i2f(ra[h][1]), qrs_g * rh.y, own[nt][1]);
-          own[nt][2] = fmaf(i2f(ra[h][2]), qrs_h * rh.x, own[nt][2]);
-          own[nt][3] = fmaf(i2f(ra[h][3]), qrs_h * rh.y, own[nt][3]);
+        for (int i = 0; i < (KSO ? NP : KS); ++i) {
+          const int ks = KSO ? o : i, np = KSO ? i : o;
+          uint32_t b0, b1, b2, b3;
+          ldsm4(la + np * 16 * C::LSTR + ks * 32, b0, b1, b2, b3);
+          if (ks == 0) {
+            mma_s8c(sa[2 * np], qa[ks], b0, b1, MAGIC_I);
+            mma_s8c(sa[2 * np + 1], qa[ks], b2, b3, MAGIC_I);
+          } else {
+            mma_s8(sa[2 * np], qa[ks], b0, b1);
+            mma_s8(sa[2 * np + 1], qa[ks], b2, b3);
+          }
+          if (np == 0 && ks == 0) slot(0);
+          if (np == NP - 1 && ks == KS / 2) slot(1);
         }
       }
 #pragma unroll
-      for (int h = 0; h < 2; ++h) {
-        const int nt = 2 * np + h;
-        part[((m * 4 + c) * NT + nt) * 32 + lane] = make_float4(own[nt][0], own[nt][1], own[nt][2], own[nt][3]);
+      for (int nt = 0; nt < NT; ++nt) {
+        const float2 sg = __half22float2(*reinterpret_cast<const __half2*>(st + C::SIG + (8 * nt + 2 * t) * 2));
+        own[nt][0] = i2f(sa[nt][0]) * (qs_g * sg.x); own[nt][1] = i2f(sa[nt][1]) * (qs_g * sg.y);
+        own[nt][2] = i2f(sa[nt][2]) * (qs_h * sg.x); own[nt][3] = i2f(sa[nt][3]) * (qs_h * sg.y);
       }
     }
+    if (has_rope) {
+      int ra[NT][4];
+      const int krow = ((lane >> 4) << 3) + (lane & 7);
+#pragma unroll
+      for (int np = 0; np < NP; ++np) {
+        uint32_t b0, b1, b2, b3;
+        ldsm4(sb + C::ROPE + (np * 16 + krow) * C::RSTR + rlg * 64 + rks * 32 + ((lane >> 3) & 1) * 16, b0, b1, b2, b3);
+        mma_s8c(ra[2 * np], qra, b0, b1, MAGIC_I);
+        mma_s8c(ra[2 * np + 1], qra, b2, b3, MAGIC_I);
+      }
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+        const float2 rh = __half22float2(*reinterpret_cast<const __half2*>(st + C::RHO + (8 * nt + 2 * t) * 2));
+        own[nt][0] = fmaf(i2f(ra[nt][0]), qrs_g * rh.x, own[nt][0]);
+        own[nt][1] = fmaf(i2f(ra[nt][1]), qrs_g * rh.y, own[nt][1]);
+        own[nt][2] = fmaf(i2f(ra[nt][2]), qrs_h * rh.x, own[nt][2]);
+        own[nt][3] = fmaf(i2f(ra[nt][3]), qrs_h * rh.y, own[nt][3]);
+      }
+    }
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+      part[((m * 4 + c) * NT + nt) * 32 + lane] = make_float4(own[nt][0], own[nt][1], own[nt][2], own[nt][3]);
+    slot(2);
     TICK(2)
     __syncthreads();                                         // B2: partials and inv-rms ready
     TICK(3)
+    slot(3);
 
     // ---- S for (row tile m, n-tiles c, c + 4, ..): the 4 partials summed in a fixed order, / rms, masked
     constexpr int NJ = NT / 4;
@@ -295,6 +356,9 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
           if (kp + 1 < end) { dg[kp + 1] = s[j][1]; dh[kp + 1] = s[j][3]; }
         }
       }
+      slot(4); slot(5);
+      cp_commit();
+      __syncthreads();
       continue;
     }
 #pragma unroll
@@ -311,6 +375,7 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
     TICK(5)
     __syncthreads();                                         // B3: per-warp row maxima ready
     TICK(6)
+    slot(4);
     {
       const float4 a0 = *reinterpret_cast<const float4*>(rmx + (m * 16 + g) * 4);
       const float4 a1 = *reinterpret_cast<const float4*>(rmx + (m * 16 + g) * 4 + 2);
@@ -319,7 +384,7 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
       mx_g = fmaxf(fmaxf(a0.x, a0.z), fmaxf(a1.x, a1.z)); ux_g = fmaxf(fmaxf(a0.y, a0.w), fmaxf(a1.y, a1.w));
       mx_h = fmaxf(fmaxf(b0.x, b0.z), fmaxf(b1.x, b1.z)); ux_h = fmaxf(fmaxf(b0.y, b0.w), fmaxf(b1.y, b1.w));
     }
-    const float mn_g = fmaxf(m_g, mx_g), mn_h = fmaxf(m_h, mx_h);
+    const float mn_g = mx_g > m_g + 8.f ? mx_g : m_g, mn_h = mx_h > m_h + 8.f ? mx_h : m_h;
     const float ms_g = mn_g == -INFINITY ? 0.f : mn_g, ms_h = mn_h == -INFINITY ? 0.f : mn_h;
     const float al_g = exp2f(m_g - ms_g), al_h = exp2f(m_h - ms_h);
     m_g = mn_g; m_h = mn_h;
@@ -342,6 +407,8 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
     }
     l_g = l_g * al_g + ps_g; l_h = l_h * al_h + ps_h;        // partial row sums (this lane's keys), reduced at the end
     __syncthreads();                                         // B4: P (int8, A-fragment order) ready
+    slot(5);
+    cp_commit();
     uint32_t pa[KB][4];
 #pragma unroll
     for (int kb = 0; kb < KB; ++kb) {
@@ -355,13 +422,18 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
       // ---- PV over this warp's column slice: 16 columns per ldmatrix.x4.trans (even / odd column n-tiles)
 #pragma unroll
       for (int ch = 0; ch < (EXP == 2 ? CH / 2 : CH); ++ch) {
-        int de[4] = {MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I}, dd[4] = {MAGIC_I, MAGIC_I, MAGIC_I, MAGIC_I};
+        int de[4], dd[4];
 #pragma unroll
         for (int kb = 0; kb < KB; ++kb) {
           uint32_t r0, r1, r2, r3;
           ldsm4t(sb + (32 * kb + lane) * C::LSTR + c * CW + ch * 16, r0, r1, r2, r3);
-          mma_s8(de, pa[kb], __byte_perm(r0, r1, 0x6420), __byte_perm(r2, r3, 0x6420));
-          mma_s8(dd, pa[kb], __byte_perm(r0, r1, 0x7531), __byte_perm(r2, r3, 0x7531));
+          if (kb == 0) {
+            mma_s8c(de, pa[kb], __byte_perm(r0, r1, 0x6420), __byte_perm(r2, r3, 0x6420), MAGIC_I);
+            mma_s8c(dd, pa[kb], __byte_perm(r0, r1, 0x7531), __byte_perm(r2, r3, 0x7531), MAGIC_I);
+          } else {
+            mma_s8(de, pa[kb], __byte_perm(r0, r1, 0x6420), __byte_perm(r2, r3, 0x6420));
+            mma_s8(dd, pa[kb], __byte_perm(r0, r1, 0x7531), __byte_perm(r2, r3, 0x7531));
+          }
         }
         if (resc) {
 #pragma unroll
@@ -387,7 +459,7 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
 #ifdef PROF
   TICK(7)
   if (lane == 0 && p.sdbg != nullptr) {
-    float* d = p.sdbg + (((size_t)blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 12 * 8 + warp * 8;
+    float* d = p.sdbg + (((size_t)blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 12 * 8 + warp * 8;   // 12 slots per CTA
     for (int i = 0; i < 8; ++i) d[i] = (float)pt[i] / (ntile > 0 ? ntile : 1);
   }
 #endif
@@ -421,16 +493,16 @@ __global__ void __launch_bounds__(NTHR, 1) int8_decode_kernel(const Params p) {
   }
 }
 
-template <int R, int BN, int MODE>
+template <int R, int BN, int NM, int MODE>
 int launch(const Params& p, int nreq, cudaStream_t s) {
-  using C = Cfg<R, BN>;
+  using C = Cfg<R, BN, NM>;
   static bool init = false;
   if (!init) {
-    cudaError_t e = cudaFuncSetAttribute(int8_decode_kernel<R, BN, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
+    cudaError_t e = cudaFuncSetAttribute(int8_decode_kernel<R, BN, NM, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM);
     if (e != cudaSuccess) return (int)e;
     init = true;
   }
-  int8_decode_kernel<R, BN, MODE><<<dim3(2, p.nsplit, nreq), NTHR, C::SMEM, s>>>(p);
+  int8_decode_kernel<R, BN, NM, MODE><<<dim3(24 / C::HBK, p.nsplit, nreq), C::NTHR, C::SMEM, s>>>(p);
   return (int)cudaGetLastError();
 }
 
@@ -439,25 +511,23 @@ int launch(const Params& p, int nreq, cudaStream_t s) {
 extern "C" int mla_int8_decode(const void* q8, const void* qs, const void* qr8, const void* qrs, const void* cache,
                                const void* bt, const void* lens, void* opart, void* lsepart, void* sdbg, int ld_dbg,
                                long long page_bytes, int stride_bt, int nsplit, int page, int nreq, int rank, int bn,
-                               int mode, void* stream) {
+                               int nm, int mode, void* stream) {
   Params p{(const int8_t*)q8, (const float*)qs, (const int8_t*)qr8, (const float*)qrs, (const uint8_t*)cache,
            (const int*)bt, (const int*)lens, (float*)opart, (float*)lsepart, (float*)sdbg,
            page_bytes, stride_bt, nsplit, page, ld_dbg};
   cudaStream_t s = (cudaStream_t)stream;
-#define DISPATCH(R_, BN_)                                                             \
-  if (rank == R_ && bn == BN_) return mode == 0 ? launch<R_, BN_, 0>(p, nreq, s) : mode == 2 ? launch<R_, BN_, 2>(p, nreq, s) : mode == 3 ? launch<R_, BN_, 3>(p, nreq, s) : launch<R_, BN_, 1>(p, nreq, s);
+#define DISPATCH(R_, BN_, NM_)                                                                                   \
+  if (rank == R_ && bn == BN_ && nm == NM_)                                                                    \
+    return mode == 0 ? launch<R_, BN_, NM_, 0>(p, nreq, s) : mode == 2 ? launch<R_, BN_, NM_, 2>(p, nreq, s)    \
+                     : launch<R_, BN_, NM_, 1>(p, nreq, s);
 #ifdef ONLY768
-  if (rank == 768 && bn == 32) return launch<768, 32, 1>(p, nreq, s);
+  if (rank == 768 && bn == 32 && nm == ONLY768) return launch<768, 32, ONLY768, 1>(p, nreq, s);
 #else
-  DISPATCH(768, 32)
-  DISPATCH(256, 32)
+  DISPATCH(768, 32, 3)
+  DISPATCH(768, 32, 2)
+  DISPATCH(256, 32, 3)
+  DISPATCH(256, 32, 2)
 #endif
 #undef DISPATCH
-  return -1;
-}
-
-extern "C" int mla_int8_smem(int rank, int bn) {
-  if (rank == 768 && bn == 32) return Cfg<768, 32>::SMEM;
-  if (rank == 256 && bn == 32) return Cfg<256, 32>::SMEM;
   return -1;
 }
