@@ -39,12 +39,30 @@ def _load():
     return lib
 
 
-def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, out, lse_out, bn=32,
-                     opart=None, lsepart=None, mode=1, sdbg=None, nm=3):
+SMS = 82   # RTX 3090; one CTA per SM for every config except (256, bn 32, nm 2) which runs 2
+
+
+def pick_config(rank, nreq, ctx):
+    """(bn, nm, nsplit) from the night-of-2026-10-21 grid on the RTX 3090 (tests/bench_int8_decode_cuda.py).
+    nm = row tiles of 16 per CTA (4 heads each): 3 -> 12-head blocks (2 CTAs per key tile), 2 -> 8-head, 1 -> 4-head."""
+    if rank == 1792:
+        bn, nm, waves = 16, 1, (3 if nreq * ctx >= 4 * 32768 else 1)
+    else:
+        bn, nm, waves = 32, (2 if nreq == 1 or nreq * ctx <= 32768 else 3), 1
+    nhb = 24 // (4 * nm)
+    return bn, nm, max(1, min(SMS * waves // (nhb * nreq), ctx // 256))
+
+
+def int8_decode_cuda(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, out, lse_out, bn=None,
+                     opart=None, lsepart=None, mode=1, sdbg=None, nm=None):
     """cache uint8 [NP, page_bytes]; block_table int32 [nreq, pages]; lens int32 [nreq] = length of MTP row 3.
-    out [nreq*4, 24, rank], lse_out [nreq*4, 24] (natural log). mode 0 = score-only probe (sdbg [nreq*96, ld] fp32)."""
+    out [nreq*4, 24, rank], lse_out [nreq*4, 24] (natural log). nsplit / bn / nm None -> pick_config(rank, nreq,
+    nsplit or the block table's capacity). mode 0 = score-only probe (sdbg [nreq*96, ld] fp32), 2 = loads only."""
     lib = _load()
     nreq = q8.shape[0]
+    if nsplit is None or bn is None or nm is None:
+        pbn, pnm, psp = pick_config(rank, nreq, block_table.shape[1] * page)
+        bn, nm, nsplit = bn or pbn, nm or pnm, nsplit or psp
     assert page % bn == 0 and block_table.dtype == torch.int32 and lens.dtype == torch.int32
     if opart is None:
         opart = torch.empty(nreq * I.HEADS * I.ROWS * nsplit * rank, dtype=torch.float32, device=q8.device)
