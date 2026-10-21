@@ -1,10 +1,10 @@
 # int8-tok decode microbench (kb2 methodology: CUDA events, median of 15, no L2 flush)
 # env: RANKS, CS, CTXS, CFGS ';'-separated 'hb=8,bn=64,w=8,st=1,pv=0,sp=0' (sp=0 -> auto)
 import os, sys, math, torch
-import pathlib; sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+sys.path.insert(0, '/home/garrett/tools/mla-vllm/src/qwen-mla-vllm')
 import qwen_mla.ops.mla_int8_decode as I
 dev = torch.device('cuda'); H = 24; ROPE = 232
-PAGE = {256: int(os.environ.get('P256', 1664)), 768: 1664, 1792: 832}
+PAGE = {256: int(os.environ.get('P256', 1664)), 768: int(os.environ.get('P768', 1664)), 1792: int(os.environ.get('P1792', 832))}
 sms = torch.cuda.get_device_properties(0).multi_processor_count
 ranks = [int(x) for x in os.environ.get('RANKS', '768').split(',')]
 cs = [int(x) for x in os.environ.get('CS', '1,4').split(',')]
@@ -48,12 +48,19 @@ for rank in ranks:
             for cfg in cfgs:
                 hb = int(cfg.get('hb', 8)); bn = int(cfg.get('bn', 64)); w = int(cfg.get('w', 8)); st = int(cfg.get('st', 1))
                 pv = int(cfg.get('pv', 0)); sp = int(cfg.get('sp', 0))
+                extra = {k: int(v) for k, v in cfg.items() if k not in ('hb','bn','w','st','pv','sp')}
                 nhb = -(-H // hb)
                 ns = sp or auto_split(c, nhb, ctx, bn)
                 opart = torch.empty(c * H * 4 * ns * rank, dtype=torch.float32, device=dev)
                 lsep = torch.empty(c * H * 4 * ns, dtype=torch.float32, device=dev)
-                fn = lambda: I.int8_decode(q8, qs, qr8, qrs, cache, bt, lens, rank, page, ns, out, lse, hb=hb, bn=bn,
-                                           pv_int8=pv, num_warps=w, num_stages=st, opart=opart, lsepart=lsep)
+                if os.environ.get('QP'):
+                    sys.path.insert(0, '/tmp/mlamx/int8'); import qprep
+                    qq = (q8, qs, qr8, qrs)
+                    fn = lambda: (qprep.prep_q(q, rank, 1 / 16.0, out=qq), I.int8_decode(q8, qs, qr8, qrs, cache, bt, lens, rank, page, ns, out, lse, hb=hb, bn=bn,
+                                           pv_int8=pv, num_warps=w, num_stages=st, opart=opart, lsepart=lsep, **extra))
+                else:
+                  fn = lambda: I.int8_decode(q8, qs, qr8, qrs, cache, bt, lens, rank, page, ns, out, lse, hb=hb, bn=bn,
+                                           pv_int8=pv, num_warps=w, num_stages=st, opart=opart, lsepart=lsep, **extra)
                 try:
                     ms = timeit(fn)
                     ns_tok = ms * 1e6 / (c * ctx)

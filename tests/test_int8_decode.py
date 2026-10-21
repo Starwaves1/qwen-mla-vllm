@@ -1,6 +1,6 @@
 # accuracy: int8-tok kernel vs exact references; FP8 kernel on the same fp32 latents
 import os, sys, math, torch
-import pathlib; _H = pathlib.Path(__file__).resolve().parent; sys.path.insert(0, str(_H.parent)); sys.path.insert(0, str(_H))
+sys.path.insert(0, '/home/garrett/tools/mla-vllm/src/qwen-mla-vllm'); sys.path.insert(0, '/home/garrett/tools/mla-vllm/src/qwen-mla-vllm/tests')
 import qwen_mla.ops.mla_int8_decode as I
 dev = torch.device('cuda'); ROPE, H = 232, 24
 SM = 1 / 16.0
@@ -83,19 +83,39 @@ def fp8_run(q, lat, rp, rms, btr, lens_rows, rank, page, splits=32):
     return o, dl, dr, T.rms_decoded(rms, scale, "log8")
 
 
-def case(nreq, ctx, rank, page, kind='real', nsplit=8, Ls=None, do_fp8=True, seed=0, hb=8, bn=64):
+def hadamard_blocks(rank, n=256):
+    """Orthonormal block-diagonal Hadamard (blocks of n): models a rotation folded into kv_a_proj / W_UK / W_UV."""
+    h = torch.ones(1, 1, device=dev)
+    while h.shape[0] < n:
+        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+    return torch.block_diag(*[h / math.sqrt(n)] * (rank // n))
+
+
+def case(nreq, ctx, rank, page, kind='real', nsplit=8, Ls=None, do_fp8=True, seed=0, hb=8, bn=64, rot=None, **kw):
     lat, rp, rms, q, bt = make(nreq, ctx, rank, page, seed + rank, kind)
-    cache = I.pack_cache(lat, rp, rms)
+    rot = int(os.environ.get('ROT', '0')) if rot is None else rot
+    if rot:
+        Hb = hadamard_blocks(rank)
+        lat_k, q_k = lat @ Hb, q.float().clone()
+        q_k[..., :rank] = q_k[..., :rank] @ Hb
+        q_k = q_k.to(torch.bfloat16)
+    else:
+        lat_k, q_k = lat, q
+    cache = I.pack_cache(lat_k, rp, rms)
     Ls = Ls or [ctx] * nreq
     lens = torch.tensor(Ls, dtype=torch.int32, device=dev)
     lens_rows = torch.tensor([L - 3 + j for L in Ls for j in range(4)], dtype=torch.int32, device=dev)
     btr = bt.repeat_interleave(4, 0).contiguous()
     dl, dr, drms = I.unpack_cache(cache, rank, page)
-    o16, lse16, qq = run_int8(q, cache, bt, lens, rank, page, nsplit, False, hb=hb, bn=bn)
-    o8, lse8, _ = run_int8(q, cache, bt, lens, rank, page, nsplit, True, hb=hb, bn=bn)
+    o16, lse16, qq = run_int8(q_k, cache, bt, lens, rank, page, nsplit, False, hb=hb, bn=bn, **kw)
+    o8, lse8, _ = run_int8(q_k, cache, bt, lens, rank, page, nsplit, True, hb=hb, bn=bn, **kw)
     qd = deq_q(*qq, rank)
     r_arith = ref(qd, dl, dr, drms, btr, lens_rows, rank, page)            # same quantized inputs as the kernel
-    r_deqc = ref(q.float(), dl, dr, drms, btr, lens_rows, rank, page)      # quantized cache, bf16 q
+    r_deqc = ref(q_k.float(), dl, dr, drms, btr, lens_rows, rank, page)    # quantized cache, bf16 q
+    if rot:   # outputs are in the rotated basis; W_UV would absorb Hb^T
+        o16, o8 = o16 @ Hb.T, o8 @ Hb.T
+        r_deqc = (r_deqc.float() @ Hb.T).double()
+        r_arith = (r_arith.float() @ Hb.T).double()
     rms_t = torch.exp2(-3.0 + ((rms.log2() + 3.0) * (255.0 / 6.0)).round().clamp(0, 255) * (6.0 / 255.0))
     r_true = ref(q.float(), lat, rp, rms_t, btr, lens_rows, rank, page)    # fp32 latents (log8 rms in both paths)
     res = dict(i16_arith=rel(o16, r_arith), i8_arith=rel(o8, r_arith), i16_true=rel(o16, r_true), i8_true=rel(o8, r_true),
@@ -109,10 +129,13 @@ def case(nreq, ctx, rank, page, kind='real', nsplit=8, Ls=None, do_fp8=True, see
 
 
 if __name__ == '__main__':
+    # basic: the three ranks x three score shapes, plain and with a block-Hadamard rotation of the latent
+    # (rot=1 models a rotation folded into kv_a_proj / W_UK / W_UV at load time; the kernel is unchanged)
     cases = os.environ.get('CASES', 'basic')
     if cases == 'basic':
-        for rank, page in ((768, 1664), (256, 1664), (1792, 832)):
-            hb, bn = (4, 32) if rank == 1792 else (8, 64)
-            for kind in ('real', 'diffuse', 'peaky'):
-                r = case(2, 5000, rank, page, kind, nsplit=4, Ls=[5000, 1700], hb=hb, bn=bn)
-                print(rank, kind, ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)
+        for rot in (0, 1):
+            for rank, page in ((768, 1664), (256, 1664), (1792, 832)):
+                kw = dict(hb=4, bn=32, acc16=True) if rank == 1792 else dict(hb=8, bn=64)
+                for kind in ('real', 'diffuse', 'peaky'):
+                    r = case(2, 5000, rank, page, kind, nsplit=4, Ls=[5000, 1700], rot=rot, **kw)
+                    print(f'rot={rot}', rank, kind, ' '.join(f'{k}={v:.2e}' if isinstance(v, float) else f'{k}={v}' for k, v in r.items()), flush=True)

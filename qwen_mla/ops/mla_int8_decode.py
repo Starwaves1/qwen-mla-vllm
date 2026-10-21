@@ -79,7 +79,7 @@ def unpack_cache(buf, R, P):
     return li * sig[..., None], ri * rho[..., None], torch.exp2(-3.0 + code * (6.0 / 255.0))
 
 
-def prep_q(q, rank, sm_scale):
+def prep_q_ref(q, rank, sm_scale):
     """q [B_rows, 24, rank + 232] (rows 4i..4i+3 = request i's MTP rows; rope packed, head h uses slot h // 6).
 
     -> q8 [nreq, 24, 4, rank] int8, qs [nreq, 24, 4] fp32, qr8 [nreq, 24, 4, 256] int8 (own slot only), qrs.
@@ -107,24 +107,72 @@ def prep_q(q, rank, sm_scale):
 
 # ------------------------------------------------------------------------------------------------ kernels
 @triton.jit
-def _qk_chunk(q, pb, tok, c: tl.constexpr, R: tl.constexpr, DC: tl.constexpr):
+def _prep_q_kernel(Q, Q8, QS, QR8, QRS, stride_qb, stride_qh, k, R: tl.constexpr, RP: tl.constexpr):
+    b = tl.program_id(0)                  # query row (request b // 4, MTP row b % 4)
+    h = tl.program_id(1)
+    req = b // 4
+    j = b % 4
+    orow = (req * 24 + h) * 4 + j
+    d = tl.arange(0, RP)
+    x = tl.load(Q + b * stride_qb + h * stride_qh + d, mask=d < R, other=0.0).to(tl.float32)
+    s = tl.max(tl.abs(x), 0) / 127.0
+    s = tl.where(s > 0, s, 1.0)
+    tl.store(Q8 + orow * R + d, tl.extra.cuda.libdevice.rint(x / s).to(tl.int8), mask=d < R)
+    tl.store(QS + orow, s * k)
+    g = h // 6
+    e = tl.arange(0, 64)
+    xr = tl.load(Q + b * stride_qb + h * stride_qh + R + g * 58 + e, mask=e < 58, other=0.0).to(tl.float32)
+    sr = tl.max(tl.abs(xr), 0) / 127.0
+    sr = tl.where(sr > 0, sr, 1.0)
+    w = tl.arange(0, 256)
+    qv = tl.extra.cuda.libdevice.rint(xr / sr).to(tl.int8)
+    tl.store(QR8 + orow * 256 + w, tl.zeros([256], tl.int8))
+    tl.debug_barrier()
+    tl.store(QR8 + orow * 256 + g * 64 + e, qv)
+    tl.store(QRS + orow, sr * k)
+
+
+
+def prep_q(q, rank, sm_scale, out=None):
+    """Triton version of prep_q_ref (same outputs up to 1 LSB from division rounding); out = preallocated tuple."""
+    B = q.shape[0]
+    nreq = B // 4
+    dev = q.device
+    if out is None:
+        out = (torch.empty(nreq, 24, 4, rank, dtype=torch.int8, device=dev), torch.empty(nreq, 24, 4, dtype=torch.float32, device=dev),
+               torch.empty(nreq, 24, 4, 256, dtype=torch.int8, device=dev), torch.empty(nreq, 24, 4, dtype=torch.float32, device=dev))
+    q8, qs, qr8, qrs = out
+    _prep_q_kernel[(B, 24)](q, q8, qs, qr8, qrs, q.stride(0), q.stride(1), sm_scale * LOG2E, R=rank,
+                            RP=triton.next_power_of_2(rank), num_warps=4)
+    return out
+
+
+@triton.jit
+def _ldk(pb, tok, c: tl.constexpr, R: tl.constexpr, DC: tl.constexpr):
+    dc = tl.arange(0, DC)
+    return tl.load(pb + tok[:, None] * R + (c * DC + dc)[None, :])
+
+
+@triton.jit
+def _qk_chunk(q, pb, tok, acc, c: tl.constexpr, R: tl.constexpr, DC: tl.constexpr):
     dc = tl.arange(0, DC)
     k = tl.load(pb + tok[:, None] * R + (c * DC + dc)[None, :])
-    return k, tl.dot(q, tl.trans(k), out_dtype=tl.int32)
+    return k, tl.dot(q, tl.trans(k), acc, out_dtype=tl.int32)
 
 
 @triton.jit
 def _pv_chunk(acc, k, pw, alpha, rsc, PV_INT8: tl.constexpr):
     if PV_INT8:
-        return acc * alpha[:, None] + tl.dot(pw, k, out_dtype=tl.int32).to(tl.float32) * rsc[:, None]
+        t = tl.dot(pw, k, out_dtype=tl.int32).to(tl.float32) * rsc[:, None]
     else:
-        return acc * alpha[:, None] + tl.dot(pw, k.to(tl.float16), out_dtype=tl.float16).to(tl.float32) * rsc[:, None]
+        t = tl.dot(pw, k.to(tl.float16), out_dtype=tl.float16).to(tl.float32) * rsc[:, None]
+    return (acc.to(tl.float32) * alpha[:, None] + t).to(acc.dtype)
 
 
 @triton.jit
 def _store_chunk(Opart, obase, acc, linv, rvalid, c: tl.constexpr, DC: tl.constexpr):
     dc = tl.arange(0, DC)
-    tl.store(Opart + obase[:, None] + (c * DC + dc)[None, :], acc * linv[:, None], mask=rvalid[:, None])
+    tl.store(Opart + obase[:, None] + (c * DC + dc)[None, :], acc.to(tl.float32) * linv[:, None], mask=rvalid[:, None])
 
 
 @triton.jit
@@ -132,6 +180,7 @@ def _int8_decode_kernel(
     Q8, QS, QR8, QRS, Cache, BT, Lens, Opart, LSEpart, stride_bt,
     R: tl.constexpr, PAGE: tl.constexpr, HB: tl.constexpr, M: tl.constexpr, BN: tl.constexpr, DC: tl.constexpr,
     NC: tl.constexpr, RW: tl.constexpr, NSPLIT: tl.constexpr, PV_INT8: tl.constexpr, PSCALE: tl.constexpr,
+    ACC16: tl.constexpr, EARLY: tl.constexpr,
 ):
     hb = tl.program_id(0)
     split = tl.program_id(1)
@@ -170,19 +219,19 @@ def _int8_decode_kernel(
 
     m_i = tl.full([M], float("-inf"), tl.float32)
     l_i = tl.zeros([M], tl.float32)
-    acc0 = tl.zeros([M, DC], tl.float32)
+    acc0 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 1:
-        acc1 = tl.zeros([M, DC], tl.float32)
+        acc1 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 2:
-        acc2 = tl.zeros([M, DC], tl.float32)
+        acc2 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 3:
-        acc3 = tl.zeros([M, DC], tl.float32)
+        acc3 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 4:
-        acc4 = tl.zeros([M, DC], tl.float32)
+        acc4 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 5:
-        acc5 = tl.zeros([M, DC], tl.float32)
+        acc5 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     if NC > 6:
-        acc6 = tl.zeros([M, DC], tl.float32)
+        acc6 = tl.zeros([M, DC], tl.float16 if ACC16 else tl.float32)
     tn = tl.arange(0, BN)
     ROPE_OFF: tl.constexpr = PAGE * R
     SIG_OFF: tl.constexpr = PAGE * (R + 256)
@@ -195,31 +244,61 @@ def _int8_decode_kernel(
         tok = (start_n % PAGE) + tn
         kpos = start_n + tn
         kin = kpos < end
-        k0, qk = _qk_chunk(q0, pb, tok, 0, R, DC)
-        if NC > 1:
-            k1, t = _qk_chunk(q1, pb, tok, 1, R, DC)
-            qk += t
-        if NC > 2:
-            k2, t = _qk_chunk(q2, pb, tok, 2, R, DC)
-            qk += t
-        if NC > 3:
-            k3, t = _qk_chunk(q3, pb, tok, 3, R, DC)
-            qk += t
-        if NC > 4:
-            k4, t = _qk_chunk(q4, pb, tok, 4, R, DC)
-            qk += t
-        if NC > 5:
-            k5, t = _qk_chunk(q5, pb, tok, 5, R, DC)
-            qk += t
-        if NC > 6:
-            k6, t = _qk_chunk(q6, pb, tok, 6, R, DC)
-            qk += t
-        kr = tl.load(pb + ROPE_OFF + tok[:, None] * 256 + wstart + rw[None, :])
+        if EARLY:   # issue every chunk's load before the first dot (more bytes in flight per tile)
+            k0 = _ldk(pb, tok, 0, R, DC)
+            if NC > 1:
+                k1 = _ldk(pb, tok, 1, R, DC)
+            if NC > 2:
+                k2 = _ldk(pb, tok, 2, R, DC)
+            if NC > 3:
+                k3 = _ldk(pb, tok, 3, R, DC)
+            if NC > 4:
+                k4 = _ldk(pb, tok, 4, R, DC)
+            if NC > 5:
+                k5 = _ldk(pb, tok, 5, R, DC)
+            if NC > 6:
+                k6 = _ldk(pb, tok, 6, R, DC)
+            kr = tl.load(pb + ROPE_OFF + tok[:, None] * 256 + wstart + rw[None, :])
+            sig = tl.load((pb + SIG_OFF).to(tl.pointer_type(tl.float16)) + tok)
+            rho = tl.load((pb + RHO_OFF).to(tl.pointer_type(tl.float16)) + tok)
+            code = tl.load((pb + RMS_OFF).to(tl.pointer_type(tl.uint8)) + head[:, None] * PAGE + tok[None, :],
+                           mask=rvalid[:, None], other=0)
+            qk = tl.dot(q0, tl.trans(k0), out_dtype=tl.int32)
+            if NC > 1:
+                qk = tl.dot(q1, tl.trans(k1), qk, out_dtype=tl.int32)
+            if NC > 2:
+                qk = tl.dot(q2, tl.trans(k2), qk, out_dtype=tl.int32)
+            if NC > 3:
+                qk = tl.dot(q3, tl.trans(k3), qk, out_dtype=tl.int32)
+            if NC > 4:
+                qk = tl.dot(q4, tl.trans(k4), qk, out_dtype=tl.int32)
+            if NC > 5:
+                qk = tl.dot(q5, tl.trans(k5), qk, out_dtype=tl.int32)
+            if NC > 6:
+                qk = tl.dot(q6, tl.trans(k6), qk, out_dtype=tl.int32)
+        else:
+            k0, qk = _qk_chunk(q0, pb, tok, tl.zeros([M, BN], tl.int32), 0, R, DC)
+            if NC > 1:
+                k1, qk = _qk_chunk(q1, pb, tok, qk, 1, R, DC)
+            if NC > 2:
+                k2, qk = _qk_chunk(q2, pb, tok, qk, 2, R, DC)
+            if NC > 3:
+                k3, qk = _qk_chunk(q3, pb, tok, qk, 3, R, DC)
+            if NC > 4:
+                k4, qk = _qk_chunk(q4, pb, tok, qk, 4, R, DC)
+            if NC > 5:
+                k5, qk = _qk_chunk(q5, pb, tok, qk, 5, R, DC)
+            if NC > 6:
+                k6, qk = _qk_chunk(q6, pb, tok, qk, 6, R, DC)
+        if not EARLY:
+            kr = tl.load(pb + ROPE_OFF + tok[:, None] * 256 + wstart + rw[None, :])
+            sig = tl.load((pb + SIG_OFF).to(tl.pointer_type(tl.float16)) + tok)
+            rho = tl.load((pb + RHO_OFF).to(tl.pointer_type(tl.float16)) + tok)
+            code = tl.load((pb + RMS_OFF).to(tl.pointer_type(tl.uint8)) + head[:, None] * PAGE + tok[None, :],
+                           mask=rvalid[:, None], other=0)
         qkr = tl.dot(qr, tl.trans(kr), out_dtype=tl.int32)
-        sig = tl.load((pb + SIG_OFF).to(tl.pointer_type(tl.float16)) + tok, mask=kin, other=0.0).to(tl.float32)
-        rho = tl.load((pb + RHO_OFF).to(tl.pointer_type(tl.float16)) + tok, mask=kin, other=0.0).to(tl.float32)
-        code = tl.load((pb + RMS_OFF).to(tl.pointer_type(tl.uint8)) + head[:, None] * PAGE + tok[None, :],
-                       mask=rvalid[:, None], other=0)
+        sig = tl.where(kin, sig.to(tl.float32), 0.0)
+        rho = rho.to(tl.float32)
         inv = tl.exp2(3.0 - code.to(tl.float32) * (6.0 / 255.0))
         s = (qk.to(tl.float32) * (qs[:, None] * sig[None, :]) + qkr.to(tl.float32) * (qrs[:, None] * rho[None, :])) * inv
         s = tl.where(kpos[None, :] < rlen[:, None], s, float("-inf"))
@@ -227,7 +306,11 @@ def _int8_decode_kernel(
         m_s = tl.where(m_new == float("-inf"), 0.0, m_new)
         alpha = tl.exp2(m_i - m_s)
         p = tl.exp2(s - m_s[:, None])
-        l_i = l_i * alpha + tl.sum(p, 1)
+        l_new = l_i * alpha + tl.sum(p, 1)
+        if ACC16:   # fp16 acc holds the normalised output (bounded by max |latent|), so it cannot overflow
+            linv_t = tl.where(l_new > 0, 1.0 / l_new, 0.0)
+            alpha = l_i * alpha * linv_t
+        l_i = l_new
         smax = tl.max(sig, 0)
         sn = sig * tl.where(smax > 0, 1.0 / smax, 0.0)
         pw = p * sn[None, :]
@@ -238,6 +321,8 @@ def _int8_decode_kernel(
         else:
             pw = (pw * PSCALE).to(tl.float16)
             rsc = tl.zeros([M], tl.float32) + smax / PSCALE
+        if ACC16:
+            rsc = rsc * linv_t
         acc0 = _pv_chunk(acc0, k0, pw, alpha, rsc, PV_INT8)
         if NC > 1:
             acc1 = _pv_chunk(acc1, k1, pw, alpha, rsc, PV_INT8)
@@ -255,6 +340,8 @@ def _int8_decode_kernel(
 
     has = l_i > 0
     linv = tl.where(has, 1.0 / l_i, 0.0)
+    if ACC16:
+        linv = tl.where(has, 1.0, 0.0)
     obase = (qrow.to(tl.int64) * NSPLIT + split) * R
     _store_chunk(Opart, obase, acc0, linv, rvalid, 0, DC)
     if NC > 1:
@@ -300,7 +387,7 @@ def _int8_reduce_kernel(Opart, LSEpart, Out, LseOut, R: tl.constexpr, RP: tl.con
 
 
 def int8_decode(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, out, lse_out, hb=8, bn=64,
-                pv_int8=False, num_warps=8, num_stages=2, opart=None, lsepart=None):
+                pv_int8=False, num_warps=8, num_stages=1, opart=None, lsepart=None, acc16=False, early=False):
     """cache uint8 [NP, page_bytes]; block_table int32 [nreq, pages]; lens int32 [nreq] = length of row 3.
     out [nreq*4, 24, rank] (row 4i+j), lse_out [nreq*4, 24] (natural log)."""
     nreq = q8.shape[0]
@@ -319,7 +406,7 @@ def int8_decode(q8, qs, qr8, qrs, cache, block_table, lens, rank, page, nsplit, 
     _int8_decode_kernel[(nhb, nsplit, nreq)](
         q8, qs, qr8, qrs, cache.view(torch.int8), block_table, lens, opart, lsepart, block_table.stride(0),
         R=rank, PAGE=page, HB=hb, M=M, BN=bn, DC=DC, NC=NC, RW=RW, NSPLIT=nsplit, PV_INT8=int(pv_int8),
-        PSCALE=psc, num_warps=num_warps, num_stages=num_stages)
+        PSCALE=psc, ACC16=int(acc16), EARLY=int(early), num_warps=num_warps, num_stages=num_stages)
     _int8_reduce_kernel[(nreq * HEADS * ROWS,)](
         opart, lsepart, out, lse_out, R=rank, RP=triton.next_power_of_2(rank), NSPLIT=nsplit,
         NSP=triton.next_power_of_2(nsplit), num_warps=4)
