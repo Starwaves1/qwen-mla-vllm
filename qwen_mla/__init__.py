@@ -320,7 +320,7 @@ def _fingerprint_compile_cache():
     the hash now also covers a digest of every qwen_mla source file, the architecture name and the
     mla_* config values; other models' hashes are untouched.
     """
-    import hashlib, json, pathlib
+    import hashlib, json, os, pathlib
     import vllm.config.model as _m
     if getattr(_m.ModelConfig.compute_hash, "_qwen_mla", False):
         return
@@ -340,7 +340,11 @@ def _fingerprint_compile_cache():
             return h
         cfg = getattr(self, "hf_text_config", None) or getattr(self, "hf_config", None)
         keys = {k: repr(v) for k, v in sorted(vars(cfg).items()) if k.startswith("mla_")} if cfg is not None else {}
-        extra = json.dumps({"archs": archs, "mla": keys, "code": code_digest}, sort_keys=True)
+        # Env switches that change the traced graph's shapes (cache row widths) or weights: an FP8 boot loaded the AOT graph of
+        # a QWEN_MLA_INT8_KV boot with the same argv and died on the first decode (q 998 wide vs 966), 2026-10-21.
+        env = {k: os.environ.get(k) for k in ("QWEN_MLA_INT8_KV", "QWEN_MLA_LATENT_ROT", "QWEN_MLA_MAX_PAGE_RATIO",
+                                              "QWEN_MLA_FP8_RMS")}
+        extra = json.dumps({"archs": archs, "mla": keys, "code": code_digest, "env": env}, sort_keys=True)
         return hashlib.sha256((h + extra).encode()).hexdigest()
     compute_hash._qwen_mla = True
     _m.ModelConfig.compute_hash = compute_hash
