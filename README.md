@@ -65,6 +65,18 @@ with `--kv-cache-dtype fp8`. Either default can be overridden (`--kv-cache-dtype
 * **Speed:** FP8-cache decode runs on the plugin's Triton kernels (FlashInfer's FP8 MLA kernel is SM90 +
   DeepSeek dims only), about 15-25% slower at moderate concurrency than the bf16 FlashInfer path.
 
+## INT8 KV cache (RTX 3090, experimental)
+
+`QWEN_MLA_INT8_KV=1` together with `--kv-cache-dtype fp8` stores the one-byte cache as int8 with a scale per token,
+in place of e4m3. The cached latent gets a block-Hadamard rotation, which is folded into the weights at load. Decode
+runs on a hand-written CUDA `mma.sync` kernel (`qwen_mla/csrc/mla_int8_decode.cu`). This helps on sm_86 because the
+3090's int8 tensor cores run at full rate, while FP8 has to be decoded in software.
+
+* **Speed** (RTX 3090, EXL3 4.50 bpw, MTP k=3, ms/step FP8 → int8): 110k c=3 95.5 → 59.6, 64k c=4 81 → 53.
+* **Quality:** KLD against bf16 KV is lower than with FP8 KV.
+* **Limits:** TP=1, 24-head models only. Tested with `QWEN_MLA_DECODE_BACKEND=triton` and `QWEN_MLA_MAX_PAGE_RATIO=2`
+  (row widths 1056 / 1056 / 2112 B for ranks 256 / 768 / 1792) and with the CPU offloading tier.
+
 ## EXL3 builds
 
 The EXL3 checkpoints are graft-built from TelperionAI/Qwen3.8-27B-EXL3-4.0bpw-v2 and run on
@@ -183,6 +195,9 @@ Nothing is required. Optional environment variables:
 | `QWEN_MLA_FP8_RMS` | `log8` | FP8 cache: format of the per-head score divisor (`log8`, `bf16` = wider rows and no MTP, `e4m3`) |
 | `QWEN_MLA_SPLITK_SCRATCH_MB` | `512` | cap on the Triton decode's split-K scratch; fewer key splits at very large batch x context |
 | `QWEN_MLA_GLA_SHARD` | `1` | `0` keeps the full latent on every GPU for grouped models (A/B testing) |
+| `QWEN_MLA_INT8_KV` | unset | `1` (with `--kv-cache-dtype fp8`): int8-tok cache and CUDA decode, see INT8 KV cache |
+| `QWEN_MLA_LATENT_ROT` | follows `QWEN_MLA_INT8_KV` | `1` / `0` forces the block-Hadamard latent rotation on or off |
+| `QWEN_MLA_MAX_PAGE_RATIO` | unset | caps the page-width ratio between latent ranks; `2` for the int8 cache |
 | `QWEN_MLA_CACHE` | `~/.cache/qwen-mla` | where the kernel overlay and compiled modules live |
 | `QWEN_MLA_FI_DEBUG` | unset | `1` logs which decode kernel each layer uses, and why |
 
